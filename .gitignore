@@ -1,0 +1,92 @@
+# ==========================================
+# SectorFlux-AI Project .gitignore
+# ==========================================
+
+### 核心安全 (絕對不能上傳) ###
+.env
+secrets.json
+config.yaml
+*.pem
+*.key
+auth_token.txt
+
+### Python 執行環境 ###
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+### 虛擬環境 ###
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+### AI 模型與大檔案 (TimesFM Weights) ###
+# 模型權重通常很大，應透過雲端存儲或直接下載到伺服器
+models/
+*.h5
+*.pkl
+*.pt
+*.pth
+*.bin
+*.joblib
+checkpoint/
+
+### 數據庫與本地數據 ###
+# 不要將爬蟲抓下來的原始數據傳上 Git
+data/
+*.csv
+*.json
+*.sql
+*.sqlite
+*.db
+# SQL Server 本地檔案 (若有)
+*.mdf
+*.ldf
+
+### Jupyter Notebook ###
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+### 網頁開發與 Dash ###
+.assets_cache/
+.dash-multi-page-cache/
+node_modules/
+.npm
+package-lock.json
+
+### Docker ###
+.dockerignore
+# 如果你有 docker-compose.override.yml 用於本地測試
+docker-compose.override.yml
+
+### IDE 相關 (VS Code / PyCharm) ###
+.vscode/
+.idea/
+*.swp
+*.swo
+
+### 系統檔案 ###
+.DS_Store
+Thumbs.db
+*.log
