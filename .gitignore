@@ -37,6 +37,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+old_files/
 
 ### 虛擬環境 ###
 venv/
