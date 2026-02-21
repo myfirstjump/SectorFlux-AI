@@ -1,0 +1,65 @@
+/* app/assets/style.css */
+
+.concentric-container {
+    position: relative;
+    width: 700px;
+    height: 700px;
+    margin: 40px auto;
+}
+
+/* 確保每個環疊加在同一位置 */
+.ring {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    transform-origin: center;
+}
+
+/* 移除 Plotly 預設的 margin 影響 */
+.ring .js-plotly-plot, .ring .plot-container {
+    width: 100%;
+    height: 100%;
+}
+
+/* 定義順時針旋轉動畫  */
+@keyframes rotate-clockwise {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* 套用不同速度與方向的動畫，賦予物理意義  */
+.outer-circle {
+    /* 歷史趨勢：緩慢、逆時針  */
+    animation: rotate-clockwise 40s linear infinite reverse; 
+}
+
+.middle-circle {
+    /* 當前市場：中速、順時針  */
+    animation: rotate-clockwise 20s linear infinite; 
+}
+
+.inner-circle {
+    /* 未來預測 (TimesFM)：快速、順時針  */
+    animation: rotate-clockwise 10s linear infinite; 
+}
+
+/* 滑鼠懸停時暫停旋轉 (進階互動準備) */
+.concentric-container:hover .ring {
+    animation-play-state: paused;
+}
+
+/* 視覺中心點 */
+.center-anchor {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 20px;
+    height: 20px;
+    background-color: white;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 0 15px rgba(255,255,255,0.8);
+}

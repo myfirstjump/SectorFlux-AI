@@ -1,68 +1,100 @@
-import requests
-import pandas as pd
-import os
-from pathlib import Path
-from dotenv import load_dotenv
+import argparse
+import logging
+import sys
+import gc
+from datetime import datetime
 
-# 1. 載入 .env 檔案中的環境變數
-load_dotenv()
-API_KEY = os.environ.get("FMP_API_KEY")
+# 導入 V5.0 規劃的模組架構
+from py_module.config import Configuration
+from py_module.database import DatabaseManipulation
+from py_module.crawler import FinancialCrawler
+from py_module.tsf_modules import TSFIntegrator
+from py_module.backtest import BacktestManager
+from py_module.cluster import L2Clusterer
 
-# 2. 建立快取資料夾
-CACHE_DIR = Path("./fmp_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+# 日誌配置：確保記錄每個模組的記憶體與執行狀態
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[
+        # 若在 Docker 內執行，確保 /app/logs 或 /workspace/logs 資料夾存在
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("SectorFlux_Main")
 
-def fetch_historical_prices_safe(ticker, api_key, start_date="2023-01-01", end_date="2023-12-31"):
-    if not api_key:
-        print("錯誤：找不到 API Key，請確認 .env 設定！")
-        return None
-        
-    cache_file = CACHE_DIR / f"{ticker}_{start_date}_{end_date}.csv"
+def run_prediction_pipeline(tsf, args):
+    """
+    序列化執行預測流水線，以符合 8GB RAM 限制
+    """
+    logger.info("啟動 L0 階層預測 (Ensemble Mode)...")
+    tsf.run_l0_ensemble(market=args.market, horizon=args.horizon)
+    gc.collect()
+
+    logger.info("啟動 L1 階層預測 (Thematic Cascading)...")
+    tsf.run_l1_cascading(horizon=args.horizon)
+    gc.collect()
+
+    logger.info("啟動 L2 階層預測 (TTM Multivariate)...")
+    tsf.run_l2_ttm(horizon=args.horizon)
+    gc.collect()
+
+def main():
+    parser = argparse.ArgumentParser(description="SectorFlux-AI 量化調度入口")
     
-    if cache_file.exists():
-        print(f"[Cache Hit] 從本地讀取 {ticker} 的歷史資料...")
-        return pd.read_csv(cache_file)
+    # 【核心修改】新增 seed_history 選項
+    parser.add_argument('--item', type=str, required=True, 
+                        choices=['crawler', 'seed_history', 'process', 'process_history', 'predict', 'backtest', 'cluster'],
+                        help='執行項目: crawler(每日更新), seed_history(建庫), process, process_history(大量新資料更新), predict, backtest, cluster')
     
-    # 【核心修正】: 改用 FMP 官方最新的 Stable API 端點
-    url = f"https://financialmodelingprep.com/stable/historical-price-eod/full?symbol={ticker}&from={start_date}&to={end_date}&apikey={api_key}"
-    print(f"[API Call] 正在向 FMP 請求 {ticker} 的歷史資料 (消耗流量中)...")
+    parser.add_argument('--horizon', type=str, default='M', choices=['M', 'Q', 'Y'], 
+                        help='預測長度: M(月), Q(季), Y(年)')
     
-    response = requests.get(url)
-    
-    if response.status_code == 200:
-        data = response.json()
-        
-        # 新版 API 回傳格式可能直接是 list，也可能包在字典裡，這裡做動態判定
-        df = None
-        if isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict) and "historical" in data:
-            df = pd.DataFrame(data["historical"])
-        elif isinstance(data, dict) and "data" in data:
-            df = pd.DataFrame(data["data"])
+    parser.add_argument('--market', type=str, default='us', choices=['us', 'tw'], help='市場目標')
+
+    args = parser.parse_args()
+    config = Configuration()
+    db = DatabaseManipulation(config)
+
+    try:
+        if args.item == 'crawler':
+            logger.info("執行每日增量爬蟲 (抓取近 30 天數據以修正拆股)...")
+            crawler = FinancialCrawler(config)
+            # 每日排程預設抓 30 天
+            crawler.fetch_all_data(market=args.market, history_days=30)
             
-        if df is not None and not df.empty:
-            # 為了保險起見，先保留所有欄位存入本地快取
-            df.to_csv(cache_file, index=False)
-            print(f"✅ 資料抓取成功並已建立快取！")
-            return df
-        else:
-            print(f"找不到 {ticker} 的資料，或回傳格式無法解析。回傳內容: {data}")
-    else:
-        print(f"API 請求失敗，狀態碼: {response.status_code}")
-        try:
-            print("詳細錯誤訊息:", response.json())
-        except:
-            print("無法解析錯誤訊息")
-            
-    return None
+        elif args.item == 'seed_history':
+            logger.info("⚠️ 啟動歷史資料大灌注 (Seed History) - 預計抓取 30 年數據...")
+            crawler = FinancialCrawler(config)
+            # 15 年約為 5475 天，這裡設定 5500 天確保涵蓋
+            crawler.fetch_all_data(market=args.market, history_days=10950)
+
+        elif args.item == 'process':
+            logger.info("開始數據預處理：計算 RS 序列與資金佔比...")
+            db.prepare_tsf_features(benchmark='VOO')
+
+        elif args.item == 'process_history':
+            logger.info("⚠️ 啟動歷史特徵大灌注 (全量計算 30 年 RS 序列)...")
+            # 傳入極大的天數 (或在 SQL 邏輯裡處理 None)，讓它全表運算一次
+            db.prepare_tsf_features(benchmark='VOO', days_to_process=None)
+
+        elif args.item == 'predict':
+            # tsf = TSFIntegrator(config, db)
+            # run_prediction_pipeline(tsf, args)
+            pass
+        elif args.item == 'backtest':
+            # bt = BacktestManager(config, db)
+            # bt.run_walk_forward(horizon=args.horizon)
+            pass
+        elif args.item == 'cluster':
+            # clusterer = L2Clusterer(config, db)
+            # clusterer.update_daily_clusters()
+            pass
+    except Exception as e:
+        logger.error(f"任務 [{args.item}] 執行失敗: {str(e)}", exc_info=True)
+        sys.exit(1)
+
+    logger.info(f"任務 [{args.item}] 執行完畢。")
 
 if __name__ == "__main__":
-    print("開始測試抓取股價 (使用最新 Stable 端點)...")
-    # 測試抓取微軟 2023 年整年的資料
-    price_data = fetch_historical_prices_safe("MSFT", API_KEY, start_date="2023-01-01", end_date="2023-12-31")
-    
-    if price_data is not None:
-        print("\n--- 資料預覽 (前 5 筆) ---")
-        # 印出最新的欄位名稱與前五筆資料
-        print(price_data.head())
+    main()

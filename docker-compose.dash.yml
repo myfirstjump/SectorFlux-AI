@@ -1,0 +1,12 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  dash-app:
+    build: ./app
+    container_name: sectorflux_dash
+    restart: always
+    ports:
+      - "80:8050"
+    environment:
+      - TZ=Asia/Taipei

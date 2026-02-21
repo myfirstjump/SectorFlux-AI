@@ -10,6 +10,11 @@ config.yaml
 *.key
 auth_token.txt
 
+### py_module
+py_module/config.py
+py_module/tsf_modules.py
+py_module/backtest.py
+
 ### Python 執行環境 ###
 __pycache__/
 *.py[cod]
@@ -55,6 +60,7 @@ checkpoint/
 ### 數據庫與本地數據 ###
 # 不要將爬蟲抓下來的原始數據傳上 Git
 data/
+raw_backup/
 *.csv
 *.json
 *.sql

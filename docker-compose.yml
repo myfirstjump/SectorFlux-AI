@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  # 1. 資料庫容器 (維持原樣)
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sectorflux_db
+    ports:
+      - "1433:1433"
+    environment:
+      - ACCEPT_EULA=Y
+      - MSSQL_SA_PASSWORD=SectorFlux_DB_2026!
+      - MSSQL_PID=Developer
+    volumes:
+      - sql_data:/var/opt/mssql
+    restart: always
+
+  # 2. Python 運算工作容器 (新增)
+  worker:
+    build: .
+    container_name: sectorflux_worker
+    depends_on:
+      - sqlserver
+    # 將本機的程式碼資料夾映射到容器內，這樣您在 VS Code 改程式碼，容器內會即時生效！
+    volumes:
+      - .:/workspace
+    # 將環境變數檔案掛載進去
+    env_file:
+      - .env
+    restart: always
+
+volumes:
+  sql_data:
