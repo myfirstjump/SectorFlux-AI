@@ -1,86 +1,69 @@
-# app/app.py
 import dash
-from dash import dcc, html
+from dash import dcc, html, Input, Output
 import plotly.graph_objects as go
 
 app = dash.Dash(__name__)
-server = app.server
 
-# 假設的產業清單
-sectors = ['半導體', '金融', '醫療', '能源', '科技', '消費', '工業', '原物料']
-# 預設等分角度與寬度
-theta = [i * (360 / len(sectors)) for i in range(len(sectors))]
-width = [360 / len(sectors) - 2] * len(sectors) # 減去 2 留出間隙
-
-def create_polar_ring(base_radius, r_value, colors, show_text=False):
-    """
-    建立獨立的極座標環
-    base_radius: 內徑起始點
-    r_value: 環的厚度
-    """
-    fig = go.Figure()
-    
-    fig.add_trace(go.Barpolar(
-        r=[r_value] * len(sectors),
-        theta=theta,
-        width=width,
-        base=[base_radius] * len(sectors),
-        marker_color=colors,
-        marker_line_color="#222222",
-        marker_line_width=2,
-        hovertext=sectors,
-        hoverinfo="text"
-    ))
-
-    # 加入產業標籤 (僅在外環顯示以保持整潔)
-    if show_text:
-        fig.add_trace(go.Scatterpolar(
-            r=[base_radius + r_value/2] * len(sectors),
-            theta=theta,
-            mode='text',
-            text=sectors,
-            textfont=dict(color='white', size=14),
-            hoverinfo='none'
-        ))
-
-    fig.update_layout(
-        polar=dict(
-            radialaxis=dict(visible=False, range=[0, 10]), # 鎖定比例尺，確保三層完美對齊
-            angularaxis=dict(visible=False),
-            bgcolor='rgba(0,0,0,0)'
+# 模擬 L0 Sankey 資料結構 (等待後端 API 餵入)
+def create_sankey(period):
+    # 這裡將介接 tsf_modules 產出的資料
+    fig = go.Figure(data=[go.Sankey(
+        node = dict(
+          pad = 15, thickness = 20,
+          line = dict(color = "black", width = 0.5),
+          label = ["Past Tech", "Past Energy", "Now Tech", "Now Energy", "Future Tech"], # 示意
+          color = "blue"
         ),
-        showlegend=False,
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(t=0, b=0, l=0, r=0)
-    )
+        link = dict(
+          source = [0, 1, 0, 2, 3], # indices correspond to labels
+          target = [2, 3, 3, 4, 4],
+          value = [8, 4, 2, 8, 4],
+          color = "rgba(100, 149, 237, 0.5)" # 這裡會綁定模型設計師的 confidence_score
+      ))])
+    fig.update_layout(title_text=f"L0: GICS 流向預測 ({period})", font_size=10, paper_bgcolor='rgba(0,0,0,0)')
     return fig
 
-# 設定三環顏色與參數
-colors_outer = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f']
-colors_mid = ['rgba(31, 119, 180, 0.7)', 'rgba(255, 127, 14, 0.7)', 'rgba(44, 160, 44, 0.7)', 'rgba(214, 39, 40, 0.7)', 'rgba(148, 103, 189, 0.7)', 'rgba(140, 86, 75, 0.7)', 'rgba(227, 119, 194, 0.7)', 'rgba(127, 127, 127, 0.7)']
-colors_inner = ['rgba(31, 119, 180, 0.4)', 'rgba(255, 127, 14, 0.4)', 'rgba(44, 160, 44, 0.4)', 'rgba(214, 39, 40, 0.4)', 'rgba(148, 103, 189, 0.4)', 'rgba(140, 86, 75, 0.4)', 'rgba(227, 119, 194, 0.4)', 'rgba(127, 127, 127, 0.4)']
-
-fig_outer = create_polar_ring(base_radius=7, r_value=2, colors=colors_outer, show_text=True)
-fig_mid = create_polar_ring(base_radius=4.5, r_value=2, colors=colors_mid)
-fig_inner = create_polar_ring(base_radius=2, r_value=2, colors=colors_inner)
-
 app.layout = html.Div([
-    html.H1("SectorFlux-AI: 產業動能輪動", style={'textAlign': 'center', 'color': 'white', 'paddingTop': '20px'}),
+    html.H1("SectorFlux-AI", className="header-title"),
     
+    # 全局時間維度控制器
     html.Div([
-        # 外環 (歷史)：緩慢逆時針 
-        html.Div(dcc.Graph(figure=fig_outer, config={'displayModeBar': False}), className='ring outer-circle'),
-        # 中環 (現在)：正常速度順時針 
-        html.Div(dcc.Graph(figure=fig_mid, config={'displayModeBar': False}), className='ring middle-circle'),
-        # 內環 (未來)：快速順時針 (TimesFM 動能) 
-        html.Div(dcc.Graph(figure=fig_inner, config={'displayModeBar': False}), className='ring inner-circle'),
-        
-        # 中間定位點 / 瞄準線基礎
-        html.Div(className='center-anchor')
-    ], className='concentric-container')
-    
-], style={'backgroundColor': '#111111', 'minHeight': '100vh', 'fontFamily': 'sans-serif'})
+        dcc.RadioItems(
+            id='period-selector',
+            options=[{'label': '月 (Month)', 'value': 'M'}, 
+                     {'label': '季 (Quarter)', 'value': 'Q'}, 
+                     {'label': '年 (Year)', 'value': 'Y'}],
+            value='M',
+            inline=True
+        )
+    ], className="control-panel"),
+
+    # L0 區塊
+    html.Div([
+        dcc.Graph(id='l0-sankey', config={'displayModeBar': False})
+    ], className="l0-container"),
+
+    # L1 區塊
+    html.Div([
+        html.H3("L1: 候選 ETF 與題材 (請點擊上方板塊)"),
+        html.Div(id='l1-content')
+    ], className="l1-container"),
+
+    # L2 區塊 (Premium)
+    html.Div([
+        html.H3("L2: 資金動態分群 (Premium 專屬)"),
+        html.Div("解鎖以查看 IBM Granite-TTM 信心度連動分析...", className="premium-lock")
+    ], className="l2-container")
+
+])
+
+# Callback 處理 M/Q/Y 切換
+@app.callback(
+    Output('l0-sankey', 'figure'),
+    Input('period-selector', 'value')
+)
+def update_l0_graph(selected_period):
+    return create_sankey(selected_period)
 
 if __name__ == '__main__':
-    app.run_server(debug=False, host='0.0.0.0', port=8050)
+    app.run_server(debug=True, host='0.0.0.0', port=8050)

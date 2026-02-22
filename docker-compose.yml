@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # 1. 資料庫容器 (維持原樣)
+  # 1. 資料庫容器 (負責 NCCI 優化與 In-DB De-beta)
   sqlserver:
     image: mcr.microsoft.com/mssql/server:2022-latest
     container_name: sectorflux_db
@@ -9,25 +9,48 @@ services:
       - "1433:1433"
     environment:
       - ACCEPT_EULA=Y
-      - MSSQL_SA_PASSWORD=SectorFlux_DB_2026!
+      - MSSQL_SA_PASSWORD=${DB_PASS}
       - MSSQL_PID=Developer
     volumes:
       - sql_data:/var/opt/mssql
     restart: always
 
-  # 2. Python 運算工作容器 (新增)
+  # 2. Python 運算工作容器 (負責後端 AI 模型與任務調度)
   worker:
     build: .
     container_name: sectorflux_worker
     depends_on:
       - sqlserver
-    # 將本機的程式碼資料夾映射到容器內，這樣您在 VS Code 改程式碼，容器內會即時生效！
     volumes:
       - .:/workspace
-    # 將環境變數檔案掛載進去
     env_file:
       - .env
     restart: always
+
+  # 3. 前端網頁呈現容器 (苦命前端的開發基地)
+  dash-app:
+    # 假設之前建立的 Dash 專案在 ./app 目錄下
+    build: ./app 
+    container_name: sectorflux_dash
+    depends_on:
+      - sqlserver
+    ports:
+      - "80:8050" # 直接把外部 Port 80 綁定到 Dash，這樣輸入 IP 就能直接看網頁
+    volumes:
+      - ./app:/app # 掛載前端程式碼，實現存檔即刻生效 (Hot Reload)
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Taipei
+    restart: always
+# --- 以下是地基工程師新增的資源防線 ---
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'           # 限制前端最多使用 1 顆 vCPU (避免繪圖吃光 4 vCPU)
+          memory: 1536M        # 限制前端最多使用 1.5GB RAM (預留 6.5GB 給 SQL 與 模型)
+        reservations:
+          memory: 512M         # 確保前端最少有 512MB 可用
 
 volumes:
   sql_data:
