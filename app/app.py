@@ -4,60 +4,110 @@ import plotly.graph_objects as go
 
 app = dash.Dash(__name__)
 
-# 模擬 L0 Sankey 資料結構 (等待後端 API 餵入)
 def create_sankey(period):
-    # 這裡將介接 tsf_modules 產出的資料
+    # --- 1. 節點定義 (Nodes Definition) ---
+    # 分為四個群組，座標區間：x=0(Past), x=0.5(Now), x=1.0(Future)
+    # y 軸座標 0 為頂部，1 為底部
+    
+    # L0 標的 (範例 3 個) + L1 標的 (範例 2 個)
+    l0_labels = ["Tech", "Energy", "Financial"]
+    l1_labels = ["Semi (SMH)", "Defense (ITA)"]
+    hedge_labels = ["Hedge"]
+    
+    # 組合所有標籤索引 (順序需固定，供 Link 使用)
+    all_labels = (
+        [f"Past {s}" for s in l0_labels + hedge_labels] +    # 0-3
+        [f"Now {s}" for s in l0_labels + hedge_labels] +     # 4-7 (Now-L0)
+        [f"Now {s}" for s in l1_labels] +                    # 8-9 (Now-L1 垂直映射區)
+        [f"Future {s}" for s in l1_labels]                   # 10-11
+    )
+
+    # --- 2. 座標配置 (Manual Positioning) ---
+    # 定義每個節點在 Sankey 畫布上的絕對位置
+    node_x = [0]*4 + [0.5]*4 + [0.5]*2 + [1]*2
+    node_y = [
+        0.1, 0.3, 0.5, 0.8,  # Past L0 (左側均分)
+        0.1, 0.3, 0.5, 0.8,  # Now L0 (中間上排)
+        0.55, 0.7,           # Now L1 (中間下排，產生垂直映射視覺感)
+        0.1, 0.6             # Future L1 (右側預測噴發區)
+    ]
+
+    # --- 3. 流向定義 (Links) ---
+    # 這裡實作：Past -> Now(L0) -> Now(L1) -> Future
+    sources = [0, 1, 3, 4, 4, 8, 9] 
+    targets = [4, 5, 7, 8, 9, 10, 11]
+    values  = [40, 30, 20, 15, 25, 18, 22] # 數值代表 Fund % 或 RS 動能
+    
+    # 顏色邏輯：與模型設計師的 Confidence Score 連動
+    link_colors = [
+        "rgba(31, 119, 180, 0.4)", # Past -> Now
+        "rgba(31, 119, 180, 0.4)",
+        "rgba(128, 128, 128, 0.3)", # Hedge 流向
+        "rgba(255, 127, 14, 0.6)",  # L0 -> L1 垂直映射 (Highlight!)
+        "rgba(255, 127, 14, 0.6)",
+        "rgba(44, 160, 44, 0.7)",   # Future 預測流
+        "rgba(44, 160, 44, 0.7)"
+    ]
+
     fig = go.Figure(data=[go.Sankey(
+        arrangement = "fixed", # 關鍵：允許自定義 (x, y)
         node = dict(
-          pad = 15, thickness = 20,
-          line = dict(color = "black", width = 0.5),
-          label = ["Past Tech", "Past Energy", "Now Tech", "Now Energy", "Future Tech"], # 示意
-          color = "blue"
+            pad = 20, thickness = 25,
+            line = dict(color = "#2c3e50", width = 1),
+            label = all_labels,
+            x = node_x, y = node_y,
+            color = ["#3498db"]*8 + ["#e67e22"]*2 + ["#2ecc71"]*2
         ),
         link = dict(
-          source = [0, 1, 0, 2, 3], # indices correspond to labels
-          target = [2, 3, 3, 4, 4],
-          value = [8, 4, 2, 8, 4],
-          color = "rgba(100, 149, 237, 0.5)" # 這裡會綁定模型設計師的 confidence_score
-      ))])
-    fig.update_layout(title_text=f"L0: GICS 流向預測 ({period})", font_size=10, paper_bgcolor='rgba(0,0,0,0)')
+            source = sources, target = targets, value = values,
+            color = link_colors,
+            # Hover 顯示資訊優化
+            hovertemplate = '流向量: %{value}<br />來源: %{source.label}<br />目標: %{target.label}<extra></extra>'
+        )
+    )])
+
+    fig.update_layout(
+        title_text=f"SectorFlux-AI: {period} 跨層級資金流向圖",
+        font_size=12,
+        font_family="Arial",
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=20, r=20, t=50, b=20)
+    )
     return fig
 
+# --- Dash Layout (維持原有結構，注入 V2.0 Figure) ---
 app.layout = html.Div([
-    html.H1("SectorFlux-AI", className="header-title"),
-    
-    # 全局時間維度控制器
+    html.Div([
+        html.H1("SectorFlux-AI", style={'textAlign': 'center', 'color': '#2c3e50'}),
+        html.P("L0 產業結構 ➔ L1 題材映射 ➔ 未來 Alpha 預測", style={'textAlign': 'center', 'color': '#7f8c8d'})
+    ], className="header"),
+
     html.Div([
         dcc.RadioItems(
             id='period-selector',
-            options=[{'label': '月 (Month)', 'value': 'M'}, 
-                     {'label': '季 (Quarter)', 'value': 'Q'}, 
-                     {'label': '年 (Year)', 'value': 'Y'}],
+            options=[{'label': '月 (M)', 'value': 'M'},
+                     {'label': '季 (Q)', 'value': 'Q'},
+                     {'label': '年 (Y)', 'value': 'Y'}],
             value='M',
-            inline=True
+            inline=True,
+            style={'padding': '20px', 'borderRadius': '10px', 'backgroundColor': '#f8f9fa'}
         )
-    ], className="control-panel"),
+    ], style={'display': 'flex', 'justifyContent': 'center'}),
 
-    # L0 區塊
     html.Div([
-        dcc.Graph(id='l0-sankey', config={'displayModeBar': False})
-    ], className="l0-container"),
+        dcc.Graph(id='l0-sankey', config={'displayModeBar': False}, style={'height': '600px'})
+    ], className="main-viz"),
 
-    # L1 區塊
+    # L2 鎖定介面 (Premium)
     html.Div([
-        html.H3("L1: 候選 ETF 與題材 (請點擊上方板塊)"),
-        html.Div(id='l1-content')
-    ], className="l1-container"),
+        html.Hr(),
+        html.H3("L2: 深度個股群組分析", style={'color': '#95a5a6'}),
+        html.Div("🔐 升級至 Premium 以解鎖 IBM Granite-TTM 2660+ 檔標的之動態分群...", 
+                 style={'padding': '40px', 'border': '2px dashed #bdc3c7', 'textAlign': 'center', 'color': '#bdc3c7'})
+    ])
+], style={'padding': '20px', 'maxWidth': '1200px', 'margin': 'auto'})
 
-    # L2 區塊 (Premium)
-    html.Div([
-        html.H3("L2: 資金動態分群 (Premium 專屬)"),
-        html.Div("解鎖以查看 IBM Granite-TTM 信心度連動分析...", className="premium-lock")
-    ], className="l2-container")
-
-])
-
-# Callback 處理 M/Q/Y 切換
 @app.callback(
     Output('l0-sankey', 'figure'),
     Input('period-selector', 'value')
@@ -66,4 +116,5 @@ def update_l0_graph(selected_period):
     return create_sankey(selected_period)
 
 if __name__ == '__main__':
+    # 針對 Linode 環境的 host/port 設定
     app.run_server(debug=True, host='0.0.0.0', port=8050)

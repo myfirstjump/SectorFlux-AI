@@ -77,6 +77,11 @@ def main():
             logger.info("⚠️ 啟動歷史特徵大灌注 (全量計算 30 年 RS 序列)...")
             # 傳入極大的天數 (或在 SQL 邏輯裡處理 None)，讓它全表運算一次
             db.prepare_tsf_features(benchmark='VOO', days_to_process=None)
+        
+        elif args.item == 'holdings':
+            logger.info("執行ETF Holdings撈取任務...")
+            crawler = FinancialCrawler(config)
+            crawler.fetch_etf_holdings()
 
         elif args.item == 'predict':
             # tsf = TSFIntegrator(config, db)
