@@ -71,12 +71,12 @@ def main():
 
         elif args.item == 'process':
             logger.info("開始數據預處理：計算 RS 序列與資金佔比...")
-            db.prepare_tsf_features(benchmark='VOO')
+            db.prepare_tsf_features(benchmark='SPY') # SPY歷史相較於VOO來得長很多，回測數據可以涵蓋2000, 2008年等歷史崩盤時刻
 
         elif args.item == 'process_history':
             logger.info("⚠️ 啟動歷史特徵大灌注 (全量計算 30 年 RS 序列)...")
             # 傳入極大的天數 (或在 SQL 邏輯裡處理 None)，讓它全表運算一次
-            db.prepare_tsf_features(benchmark='VOO', days_to_process=None)
+            db.prepare_tsf_features(benchmark='SPY', days_to_process=None)
         
         elif args.item == 'holdings':
             logger.info("執行ETF Holdings撈取任務...")

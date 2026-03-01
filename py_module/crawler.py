@@ -47,8 +47,6 @@ class FinancialCrawler:
             macro_universe = getattr(self.config, 'MACRO_UNIVERSE', []) # 加入宏觀因子
             target_universe = self.config.get_all_tickers()
             target_universe = target_universe + macro_universe
-            # target_universe = macro_universe  ### 只爬 MACRO 的項目時打開
-
 
             # === 🛡️ 階段一：拆股雷達 (Split Radar) ===
             split_tickers = self._detect_splits(target_universe)
