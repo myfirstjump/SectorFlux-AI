@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # 1. 資料庫容器 (負責 NCCI 優化與 In-DB De-beta)
   sqlserver:
@@ -43,7 +41,6 @@ services:
     environment:
       - TZ=Asia/Taipei
     restart: always
-# --- 以下是地基工程師新增的資源防線 ---
     deploy:
       resources:
         limits:
