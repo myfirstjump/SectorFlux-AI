@@ -95,3 +95,7 @@ docker-compose.override.yml
 .DS_Store
 Thumbs.db
 *.log
+
+### Claude相關
+.claude/
+CLAUDE.md

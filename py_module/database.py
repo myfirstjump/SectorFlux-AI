@@ -9,9 +9,54 @@ from loguru import logger
 from py_module.config import Configuration 
 
 class DatabaseManipulation:
+    _schema_migrated = False  # 每個 process 只跑一次 schema migration
+
     def __init__(self, config):
         self.config = config
         self.engine = self._create_engine()
+        if not DatabaseManipulation._schema_migrated:
+            self._run_schema_migrations()
+            DatabaseManipulation._schema_migrated = True
+
+    def _run_schema_migrations(self):
+        """
+        [一次性] 確保 Fact_DailyPrice schema 與當前設計一致。
+
+        雙軌市值欄位設計：
+          Market_Cap         = FMP API 原始值，永不被修正邏輯覆寫（不可變基準線）
+          Market_Cap_Refined = 拆股 MC 修正後的工作市值（fix_split_mc 寫入此欄）
+
+        Flux 計算一律使用 COALESCE(Market_Cap_Refined, Market_Cap)，
+        確保有修正時用修正值，無修正時 fallback 到 FMP 原始值。
+
+        廢棄欄位（v2 起停用）：
+          RS_Ratio, Log_Return_RS, ZScore_20D — 原以 Price/RS 為基礎的特徵，
+          改為以 Flux 為基礎重新設計，舊欄位由此 migration 移除。
+        """
+        try:
+            with self.engine.connect() as conn:
+                # 新增雙軌市值欄位
+                conn.execute(text(
+                    "IF COL_LENGTH('Fact_DailyPrice', 'Market_Cap_Refined') IS NULL "
+                    "ALTER TABLE Fact_DailyPrice ADD Market_Cap_Refined FLOAT NULL"
+                ))
+                # 移除舊版 Price-based 特徵欄位
+                conn.execute(text(
+                    "IF COL_LENGTH('Fact_DailyPrice', 'RS_Ratio') IS NOT NULL "
+                    "ALTER TABLE Fact_DailyPrice DROP COLUMN RS_Ratio"
+                ))
+                conn.execute(text(
+                    "IF COL_LENGTH('Fact_DailyPrice', 'Log_Return_RS') IS NOT NULL "
+                    "ALTER TABLE Fact_DailyPrice DROP COLUMN Log_Return_RS"
+                ))
+                conn.execute(text(
+                    "IF COL_LENGTH('Fact_DailyPrice', 'ZScore_20D') IS NOT NULL "
+                    "ALTER TABLE Fact_DailyPrice DROP COLUMN ZScore_20D"
+                ))
+                conn.commit()
+                logger.debug("Schema migration OK: Market_Cap_Refined added; RS/ZScore columns removed.")
+        except Exception as e:
+            logger.warning(f"⚠️ Schema migration 執行失敗（Fact_DailyPrice 可能尚未建立）: {e}")
 
     def _create_engine(self):
         """
@@ -57,11 +102,15 @@ class DatabaseManipulation:
             if col not in df.columns:
                 df[col] = None 
 
-        # 準備批量資料 (List of Tuples)，並強制將日期轉為字串
-        # 使用 .to_dict('records') 是為了配合具名參數 :col 注入
+        # 準備批量資料，並強制將日期轉為字串
+        # SQL Server FLOAT 欄位不接受 Python float('nan')；pyodbc 會將 nan 序列化為字串 'nan'
+        # 導致 "Error converting data type varchar to float"，必須替換為 None（→ SQL NULL）
         records = df[required_cols].copy()
         records['Date'] = pd.to_datetime(records['Date']).dt.strftime('%Y-%m-%d')
-        data_list = records.to_dict('records')
+        data_list = [
+            {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.items()}
+            for row in records.to_dict('records')
+        ]
 
         unique_suffix = uuid.uuid4().hex[:8]
         staging_table = f"#Staging_{table_name}_{unique_suffix}"
@@ -100,14 +149,15 @@ class DatabaseManipulation:
                 USING {staging_table} AS source
                 ON target.Date = source.Date AND target.Symbol = source.Symbol
                 WHEN MATCHED THEN
-                    UPDATE SET 
+                    UPDATE SET
                         target.[Open] = source.[Open],
                         target.High = source.High,
                         target.Low = source.Low,
                         target.[Close] = source.[Close],
                         target.Volume = source.Volume,
                         target.Market_Cap = source.Market_Cap,
-                        target.Shares_Outstanding = source.Shares_Outstanding
+                        target.Shares_Outstanding = source.Shares_Outstanding,
+                        target.Market_Cap_Refined = NULL
                 WHEN NOT MATCHED THEN
                     INSERT (Date, Symbol, [Open], High, Low, [Close], Volume, Market_Cap, Shares_Outstanding)
                     VALUES (source.Date, source.Symbol, source.[Open], source.High, source.Low, source.[Close], source.Volume, source.Market_Cap, source.Shares_Outstanding);
@@ -132,10 +182,10 @@ class DatabaseManipulation:
         sectors = self.config.L0_SECTORS
         symbols_str = "'" + "','".join(sectors) + "'"
         
-        # 抓取該日所有板塊的市值
+        # 抓取該日所有板塊的市值（優先使用修正值，fallback 到 FMP 原始值）
         query = f"""
-            SELECT Symbol, Market_Cap 
-            FROM Fact_DailyPrice 
+            SELECT Symbol, COALESCE(Market_Cap_Refined, Market_Cap) AS Market_Cap
+            FROM Fact_DailyPrice
             WHERE [Date] = :d AND Symbol IN ({symbols_str})
         """
         df = self.execute_query(query, params={"d": date_str})
@@ -353,81 +403,6 @@ class DatabaseManipulation:
             # 發生錯誤時確保回滾
             raise e
 
-    def prepare_tsf_features(self, benchmark='SPY', days_to_process=None):
-
-
-        """
-        [高效能] 使用 SQL 原生指令計算 RS、Log_Return_RS 與 20日滾動 Z-Score
-        """
-        logger.info(f"⚙️ 啟動 RS 特徵工程 (Benchmark: {benchmark})...")
-        
-        try:
-            with self.engine.connect() as conn:
-                trans = conn.begin()
-                
-                # 1. 確保新欄位存在
-                conn.execute(text("IF COL_LENGTH('Fact_DailyPrice', 'RS_Ratio') IS NULL ALTER TABLE Fact_DailyPrice ADD RS_Ratio FLOAT"))
-                conn.execute(text("IF COL_LENGTH('Fact_DailyPrice', 'Log_Return_RS') IS NULL ALTER TABLE Fact_DailyPrice ADD Log_Return_RS FLOAT"))
-                conn.execute(text("IF COL_LENGTH('Fact_DailyPrice', 'ZScore_20D') IS NULL ALTER TABLE Fact_DailyPrice ADD ZScore_20D FLOAT"))
-                
-                date_filter = ""
-                if days_to_process:
-                     date_filter = f"AND T1.Date >= DATEADD(day, -{days_to_process}, GETDATE())"
-
-                # 2. 計算 RS_Ratio (相對強度)
-                logger.info("🚀 [1/3] 計算 RS_Ratio...")
-                sql_rs = text(f"""
-                    UPDATE T1
-                    SET T1.RS_Ratio = T1.[Close] / NULLIF(T2.[Close], 0)
-                    FROM Fact_DailyPrice T1
-                    INNER JOIN Fact_DailyPrice T2 ON T1.Date = T2.Date
-                    WHERE T2.Symbol = :benchmark
-                    {date_filter}
-                """)
-                conn.execute(sql_rs, {"benchmark": benchmark})
-
-                # 3. 計算 Log_Return_RS (對數報酬率)
-                logger.info("🚀 [2/3] 計算 Log_Return_RS (對數報酬率)...")
-                sql_log_ret = text(f"""
-                    WITH CTE_Prev AS (
-                        SELECT Date, Symbol, RS_Ratio,
-                               LAG(RS_Ratio) OVER (PARTITION BY Symbol ORDER BY Date) AS Prev_RS
-                        FROM Fact_DailyPrice
-                    )
-                    UPDATE T
-                    SET T.Log_Return_RS = LOG(T.RS_Ratio / NULLIF(C.Prev_RS, 0))
-                    FROM Fact_DailyPrice T
-                    INNER JOIN CTE_Prev C ON T.Date = C.Date AND T.Symbol = C.Symbol
-                    WHERE T.RS_Ratio IS NOT NULL AND C.Prev_RS IS NOT NULL
-                    {date_filter.replace('T1.', 'T.')}
-                """)
-                conn.execute(sql_log_ret)
-
-                # 4. 計算 ZScore_20D (20日滾動標準化)
-                logger.info("🚀 [3/3] 計算 20日滾動 ZScore_20D...")
-                sql_zscore = text(f"""
-                    WITH CTE_Stats AS (
-                        SELECT Date, Symbol, Log_Return_RS,
-                               AVG(Log_Return_RS) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS Avg_20D,
-                               STDEV(Log_Return_RS) OVER (PARTITION BY Symbol ORDER BY Date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW) AS Std_20D
-                        FROM Fact_DailyPrice
-                    )
-                    UPDATE T
-                    SET T.ZScore_20D = (T.Log_Return_RS - C.Avg_20D) / NULLIF(C.Std_20D, 0)
-                    FROM Fact_DailyPrice T
-                    INNER JOIN CTE_Stats C ON T.Date = C.Date AND T.Symbol = C.Symbol
-                    WHERE T.Log_Return_RS IS NOT NULL
-                    {date_filter.replace('T1.', 'T.')}
-                """)
-                conn.execute(sql_zscore)
-                
-                trans.commit()
-                logger.info("✅ 特徵工程全系列 (RS, Log_Return, Z-Score) 批量計算完畢！")
-                
-        except Exception as e:
-            logger.error(f"❌ RS 特徵工程失敗: {e}")
-            raise e
-        
     def generate_net_flux_matrix(self, past_date, now_date, target_assets=None, hedge_assets=None):
         """
         [運算引擎] 計算 ETF Observed Method，產出 12x12 資金流轉矩陣
@@ -442,10 +417,11 @@ class DatabaseManipulation:
             
         all_tickers = list(set(target_assets + hedge_assets))
         
-        # 2. 抓取資料 (使用具名參數與 Tuple 以利 SQL 自動擴展)
+        # 2. 抓取資料（優先使用修正值，fallback 到 FMP 原始值）
         query = """
-            SELECT [Date], Symbol, [Close] AS Price, Market_Cap 
-            FROM Fact_DailyPrice 
+            SELECT [Date], Symbol, [Close] AS Price,
+                   COALESCE(Market_Cap_Refined, Market_Cap) AS Market_Cap
+            FROM Fact_DailyPrice
             WHERE [Date] IN :dates AND Symbol IN :symbols
         """
         df = self.execute_query(query, params={
@@ -614,3 +590,159 @@ class DatabaseManipulation:
 
         except Exception as e:
             logger.error(f"❌ {table_name} 寫入失敗: {e}")
+
+    def fix_split_mc_corrections(self, symbols, fmp_api_key, base_url="https://financialmodelingprep.com", dry_run=True):
+        """
+        [MC 拆股修正] 偵測並修正 FMP 錯誤回溯調整 Market_Cap 所造成的歷史斷崖。
+
+        背景：FMP 在拆股後會將歷史 Price 與 Market_Cap 同時除以拆股比例。Price 調整是
+        業界慣例，但 MC 調整是 FMP 的錯誤行為（MC = P×N，拆股不改變 MC）。此錯誤
+        導致 Flux 計算跨越拆股日時看到人造的巨額假流量。
+
+        FMP 的三種調整行為（均需處理）：
+        - 乾淨型（如 XLK）：拆股後一次性回溯所有歷史，但 post day-1 shares 尚未創建完畢
+          → 直接用緊鄰前後比較會低估（1.18x 而非 2x）
+        - 提前型（如 XLU）：拆股日前一天 MC 已跳到正確值，更早的記錄才需修正
+          → 以「緊鄰前」為比較基準會把已修正的記錄納入
+        - 分段型（如 XLY/XLE）：FMP 分兩批回溯，導致 pre-window 已含二次調整值
+          → 緊鄰前比較基準已偏高
+
+        偵測策略（threshold 法，天然幂等）：
+        1. 以「拆股日前 15~60 天」的穩定中位 MC 作為 stable_pre（避開過渡帶）
+        2. 計算閾值 threshold = stable_pre × (1 + ratio) / 2
+           （即「已被 FMP 砍半後」與「正確值」的中點）
+        3. UPDATE 條件加入 Market_Cap < threshold：
+           - 已被 FMP 砍半的記錄：MC ≈ stable_pre → 低於閾值 → 會被修正
+           - 過渡帶/已正確的記錄：MC ≈ stable_pre × ratio → 高於閾值 → 自動跳過
+        4. 重複執行安全：修正後記錄 MC 升至 stable_pre × ratio，超出閾值，不會再被修正
+        """
+        import requests
+
+        all_corrections = []
+
+        for symbol in symbols:
+            try:
+                resp = requests.get(
+                    f"{base_url}/stable/splits?symbol={symbol}&apikey={fmp_api_key}",
+                    timeout=10
+                )
+                if resp.status_code != 200 or not resp.json():
+                    continue
+                splits = sorted(resp.json(), key=lambda x: x["date"], reverse=True)
+            except Exception as e:
+                logger.warning(f"⚠️ {symbol} 無法取得拆股資料: {e}")
+                continue
+
+            for split in splits:
+                split_date = split["date"]
+                ratio = split["numerator"] / split["denominator"]
+
+                if abs(ratio - 1.0) < 0.001:
+                    continue
+
+                # 跳過反向拆股（ratio < 1）及小幅 NAV 調整（ratio < 1.5）
+                # 這些案例的偵測邏輯會將自然歷史成長誤判為 FMP 錯誤調整
+                if ratio < 1.5:
+                    logger.debug(f"  SKIP {symbol} {split_date} ratio={ratio:.4f} (非正向拆股或幅度過小)")
+                    continue
+
+                # 1. 取得穩定前期 MC：拆股日前 15~60 天，取中位數避免離群值
+                stable_df = self.execute_query("""
+                    SELECT TOP 10 Market_Cap
+                    FROM Fact_DailyPrice
+                    WHERE Symbol = :sym
+                      AND Date < DATEADD(day, -14, :sd)
+                      AND Date >= DATEADD(day, -75, :sd)
+                      AND Market_Cap IS NOT NULL AND Market_Cap > 0
+                    ORDER BY Date DESC
+                """, params={"sym": symbol, "sd": split_date})
+
+                if stable_df.empty:
+                    continue
+
+                stable_pre_mc = stable_df["Market_Cap"].median()
+                if stable_pre_mc <= 0:
+                    continue
+
+                # 2. 閾值：「已砍半值」與「正確值」之間的中點
+                #    (1 + ratio) / 2：ratio=2 → threshold = 1.5 × stable_pre
+                threshold = stable_pre_mc * (1 + ratio) / 2
+
+                # 3. 計算在閾值以下（即被 FMP 砍半）且在拆股日前的記錄數
+                count_df = self.execute_query("""
+                    SELECT COUNT(*) AS cnt FROM Fact_DailyPrice
+                    WHERE Symbol     = :sym
+                      AND Date       <= :sd
+                      AND Market_Cap <  :thr
+                      AND Market_Cap IS NOT NULL
+                """, params={"sym": symbol, "sd": split_date, "thr": threshold})
+
+                affected_rows = int(count_df.iloc[0, 0]) if not count_df.empty else 0
+                if affected_rows == 0:
+                    logger.debug(f"  SKIP {symbol} {split_date} {split['numerator']}:{split['denominator']} (無需修正或已修正)")
+                    continue
+
+                all_corrections.append({
+                    "symbol":     symbol,
+                    "split_date": split_date,
+                    "ratio":      ratio,
+                    "label":      f"{split['numerator']}:{split['denominator']}",
+                    "stable_pre": stable_pre_mc / 1e9,
+                    "threshold":  threshold / 1e9,
+                    "rows":       affected_rows,
+                })
+
+            time.sleep(0.05)
+
+        # ── 報告 ──────────────────────────────────────────────
+        if not all_corrections:
+            logger.success("✅ 掃描完畢：未發現需要修正的 MC 斷崖。")
+            return
+
+        logger.info(f"\n{'='*70}")
+        logger.info(f"  MC 拆股修正報告（{'DRY-RUN，不寫入' if dry_run else '即將執行寫入'}）")
+        logger.info(f"{'='*70}")
+        for c in all_corrections:
+            logger.info(
+                f"  {c['symbol']:<8} {c['split_date']}  {c['label']:<12}"
+                f"  stable_pre={c['stable_pre']:.2f}B  threshold={c['threshold']:.2f}B"
+                f"  → 修正 {c['rows']:,} 筆"
+            )
+        logger.info(f"{'='*70}")
+        logger.info(f"  共 {len(all_corrections)} 筆拆股事件需修正")
+
+        if dry_run:
+            logger.warning("DRY-RUN 模式，未執行任何寫入。加上 --apply 參數以實際修正。")
+            return
+
+        # ── 執行修正 ──────────────────────────────────────────
+        logger.info("🔧 開始執行 MC 修正...")
+        fixed = 0
+        for c in all_corrections:
+            try:
+                with self.engine.connect() as conn:
+                    trans = conn.begin()
+                    # Market_Cap × ratio；Shares_Outstanding = 新 MC / Close
+                    # SQL Server 中 SET 子句各欄位均引用修改前的原始值，故此寫法正確
+                    conn.execute(text("""
+                        UPDATE Fact_DailyPrice
+                        SET
+                            Market_Cap          = Market_Cap * :ratio,
+                            Shares_Outstanding  = Market_Cap * :ratio / NULLIF([Close], 0)
+                        WHERE Symbol     = :sym
+                          AND Date       <= :sd
+                          AND Market_Cap IS NOT NULL
+                          AND Market_Cap <  :thr
+                    """), {
+                        "ratio": c["ratio"],
+                        "sym":   c["symbol"],
+                        "sd":    c["split_date"],
+                        "thr":   c["threshold"] * 1e9,
+                    })
+                    trans.commit()
+                logger.success(f"  ✅ {c['symbol']} {c['split_date']} ({c['label']}) 修正完畢（{c['rows']:,} 筆）")
+                fixed += 1
+            except Exception as e:
+                logger.error(f"  ❌ {c['symbol']} {c['split_date']} 修正失敗: {e}")
+
+        logger.success(f"\n🎉 MC 拆股修正完成：{fixed}/{len(all_corrections)} 筆事件已處理。")

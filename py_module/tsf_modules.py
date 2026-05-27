@@ -22,55 +22,16 @@ class TSFIntegrator:
 
     def create_input_tensor(self, db_manager, latest_date, context_window=512):
         """
-        從現有 Fact_DailyPrice 提取 Z-Score 並封裝為 19 頻道張量。
+        [待重新設計] 模型輸入張量封裝。
+
+        原設計使用 ZScore_20D（Price-based RS 特徵），已於 v2 schema migration 移除。
+        新版特徵應改以 Flux-based 指標為輸入（Fact_NodeFlux / 衍生 Z-Score），
+        待 ULTRA 重抓完成、Flux 計算穩定後重新實作。
         """
-        # 定義 11 Sectors + 7 Macro 原始標的
-        L0_SECTORS = self.config.L0_SECTORS # ['XLK', 'XLF', 'XLV', 'XLE', 'XLI', 'XLY', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC']
-        MACRO_RAW = self.config.MACRO_UNIVERSE # ["GLD", "USO", "UUP", "^FVX", "^TNX", "^VIX", "DX-Y.NYB"]
-        target_symbols = L0_SECTORS + MACRO_RAW
-        
-        # 最終張量頻道順序 (對齊模型輸入規範)
-        FINAL_CHANNELS = L0_SECTORS + MACRO_RAW + ["SPREAD_10Y5Y"]
-
-        try:
-            query = """
-            SELECT Date, Symbol, ZScore_20D 
-            FROM Fact_DailyPrice 
-            WHERE Symbol IN :symbols 
-            AND Date <= :latest_date
-            ORDER BY Date DESC
-            """
-            params = {
-            "symbols": tuple(target_symbols),
-            "latest_date": latest_date
-            }
-            # 利用數據維運官優化的 SQLAlchemy 引擎執行
-            raw_df = db_manager.execute_query(query, params=params)
-            
-            if raw_df.empty:
-                logger.error(f"TSF | {latest_date} 前無數據，請檢查爬蟲與 NCCI 運算狀態。")
-                return None
-
-            pivot_df = raw_df.pivot(index='Date', columns='Symbol', values='ZScore_20D')
-            pivot_df = pivot_df.ffill().bfill() 
-            pivot_df = pivot_df.sort_index().tail(self.context_window)
-            
-            # 動態計算 10Y-5Y 利差 (SPREAD)
-            if '^TNX' in pivot_df.columns and '^FVX' in pivot_df.columns:
-                pivot_df['SPREAD_10Y5Y'] = pivot_df['^TNX'] - pivot_df['^FVX']
-            else:
-                pivot_df['SPREAD_10Y5Y'] = 0.0
-
-            # 截取最後 512 天並轉換為模型所需的 [1, 512, 19] 張量
-            final_df = pivot_df[FINAL_CHANNELS].tail(context_window)
-            input_tensor = torch.tensor(final_df.values, dtype=torch.float32).unsqueeze(0)
-            
-            logger.info(f"TSF | 張量封裝成功！通道數: {len(FINAL_CHANNELS)}, Shape: {list(input_tensor.shape)}")
-            return input_tensor
-
-        except Exception as e:
-            logger.error(f"TSF | 張量產製異常: {e}")
-            return None
+        raise NotImplementedError(
+            "create_input_tensor 需以 Flux-based 特徵重新實作。"
+            "ZScore_20D（Price-based）已從 Fact_DailyPrice 移除。"
+        )
 
     def run_ttm_inference(self, input_tensor):
         """

@@ -61,11 +61,12 @@ def run_prediction_pipeline(tsf, args):
 
 def main():
     parser = argparse.ArgumentParser(description="SectorFlux-AI 量化調度入口")
-    parser.add_argument('--item', type=str, required=True, 
-                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings'],
+    parser.add_argument('--item', type=str, required=True,
+                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc'],
                         help='執行項目')
     parser.add_argument('--horizon', type=str, default='M', choices=['M', 'Q', 'Y'], help='預測長度')
     parser.add_argument('--market', type=str, default='us', choices=['us', 'tw'], help='市場目標')
+    parser.add_argument('--apply', action='store_true', help='fix_split_mc：實際執行寫入（預設為 dry-run）')
 
     args = parser.parse_args()
     config = Configuration()
@@ -82,18 +83,28 @@ def main():
             crawler = FinancialCrawler(config)
             crawler.fetch_all_data(market=args.market, history_days=10950)
 
-        elif args.item == 'process':
-            logger.info("開始數據預處理：計算 RS 序列與資金佔比...")
-            db.prepare_tsf_features(benchmark='SPY')
-
-        elif args.item == 'process_history':
-            logger.warning("⚠️ 啟動歷史特徵大灌注 (全量計算 30 年 RS 序列)...")
-            db.prepare_tsf_features(benchmark='SPY', days_to_process=None)
+        elif args.item in ('process', 'process_history'):
+            logger.warning("⚠️ RS/ZScore 特徵計算已停用（Price-based 特徵已移除，待以 Flux-based 特徵重新設計）。")
+            sys.exit(1)
         
         elif args.item == 'holdings':
             logger.info("執行 ETF Holdings 撈取任務...")
             crawler = FinancialCrawler(config)
-            crawler.fetch_all_holdings()
+            crawler.fetch_etf_holdings()
+
+        elif args.item == 'fix_split_mc':
+            mode = "執行寫入" if args.apply else "DRY-RUN（預覽，不寫入）"
+            logger.info(f"🔧 啟動 MC 拆股修正任務（{mode}）...")
+            symbols = (
+                config.L0_SECTORS + config.L1_THEMATICS + config.L2_UNIVERSE +
+                config.RISK_PROXY + config.AUTHORITATIVE_ETFS
+            )
+            symbols = list(set(symbols))
+            db.fix_split_mc_corrections(
+                symbols=symbols,
+                fmp_api_key=config.FMP_API_KEY,
+                dry_run=not args.apply,
+            )
 
         elif args.item == 'calculate_flux':
             # 1. 取得最新交易日作為 Now
