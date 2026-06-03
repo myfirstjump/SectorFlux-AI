@@ -35,12 +35,11 @@ class DatabaseManipulation:
         """
         try:
             with self.engine.connect() as conn:
-                # 新增雙軌市值欄位
+                # ── Fact_DailyPrice 欄位維護 ─────────────────────────
                 conn.execute(text(
                     "IF COL_LENGTH('Fact_DailyPrice', 'Market_Cap_Refined') IS NULL "
                     "ALTER TABLE Fact_DailyPrice ADD Market_Cap_Refined FLOAT NULL"
                 ))
-                # 移除舊版 Price-based 特徵欄位
                 conn.execute(text(
                     "IF COL_LENGTH('Fact_DailyPrice', 'RS_Ratio') IS NOT NULL "
                     "ALTER TABLE Fact_DailyPrice DROP COLUMN RS_Ratio"
@@ -53,10 +52,48 @@ class DatabaseManipulation:
                     "IF COL_LENGTH('Fact_DailyPrice', 'ZScore_20D') IS NOT NULL "
                     "ALTER TABLE Fact_DailyPrice DROP COLUMN ZScore_20D"
                 ))
+
+                # ── Fact_NodeAllocation（12 節點資金分佈比例）────────
+                conn.execute(text("""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sysobjects
+                        WHERE name='Fact_NodeAllocation' AND xtype='U'
+                    )
+                    CREATE TABLE Fact_NodeAllocation (
+                        [Date]            DATE         NOT NULL,
+                        [Node_ID]         VARCHAR(20)  NOT NULL,
+                        [Lookback_Window] INT          NOT NULL,
+                        [Weight]          FLOAT        NOT NULL,
+                        [Updated_At]      DATETIME     DEFAULT GETDATE(),
+                        CONSTRAINT PK_Fact_NodeAllocation
+                            PRIMARY KEY ([Date], [Node_ID], [Lookback_Window])
+                    )
+                """))
+
+                # ── Fact_NodeFlux（12×12 資金流轉矩陣）───────────────
+                conn.execute(text("""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sysobjects
+                        WHERE name='Fact_NodeFlux' AND xtype='U'
+                    )
+                    CREATE TABLE Fact_NodeFlux (
+                        [Date]             DATE         NOT NULL,
+                        [Source_Node_ID]   VARCHAR(20)  NOT NULL,
+                        [Target_Node_ID]   VARCHAR(20)  NOT NULL,
+                        [Lookback_Window]  INT          NOT NULL,
+                        [Amount]           FLOAT,
+                        [Flux_Weight]      FLOAT,
+                        [Updated_At]       DATETIME     DEFAULT GETDATE(),
+                        CONSTRAINT PK_Fact_NodeFlux
+                            PRIMARY KEY ([Date], [Source_Node_ID],
+                                         [Target_Node_ID], [Lookback_Window])
+                    )
+                """))
+
                 conn.commit()
-                logger.debug("Schema migration OK: Market_Cap_Refined added; RS/ZScore columns removed.")
+                logger.debug("Schema migration OK: 雙軌市值欄位 + Fact_NodeAllocation/Fact_NodeFlux 就緒。")
         except Exception as e:
-            logger.warning(f"⚠️ Schema migration 執行失敗（Fact_DailyPrice 可能尚未建立）: {e}")
+            logger.warning(f"⚠️ Schema migration 執行失敗: {e}")
 
     def _create_engine(self):
         """
@@ -157,7 +194,17 @@ class DatabaseManipulation:
                         target.Volume = source.Volume,
                         target.Market_Cap = source.Market_Cap,
                         target.Shares_Outstanding = source.Shares_Outstanding,
-                        target.Market_Cap_Refined = NULL
+                        target.Market_Cap_Refined = CASE
+                            -- FMP 回溯調整了歷史 MC（拆股後 >20% 變動）→ 清空，待 fix_split_mc 重修正
+                            WHEN source.Market_Cap IS NOT NULL
+                             AND target.Market_Cap IS NOT NULL
+                             AND target.Market_Cap > 0
+                             AND ABS(source.Market_Cap - target.Market_Cap)
+                                 / target.Market_Cap > 0.20
+                            THEN NULL
+                            -- 正常每日小幅波動：保留既有修正值，避免 staircase 被覆蓋
+                            ELSE target.Market_Cap_Refined
+                        END
                 WHEN NOT MATCHED THEN
                     INSERT (Date, Symbol, [Open], High, Low, [Close], Volume, Market_Cap, Shares_Outstanding)
                     VALUES (source.Date, source.Symbol, source.[Open], source.High, source.Low, source.[Close], source.Volume, source.Market_Cap, source.Shares_Outstanding);
@@ -173,65 +220,98 @@ class DatabaseManipulation:
             raise e
 
 
-    def upsert_node_allocation(self, date_str, lookback_window=512):
+    def upsert_node_allocation(self, now_str, past_str, lookback_window=21):
         """
-        [事實持久化] 計算並儲存特定日期的資金分佈比例 (Fact_NodeAllocation)
+        [事實持久化] 計算並儲存 12 節點資金分佈比例（Fact_NodeAllocation）
+
+        12 節點 = 11 L0 板塊 + 1 HEDGE（BIL + SHV + TLT + GLD 合計）
+
+        PK 設計（與 Fact_NodeFlux 對齊）：
+          Date            = now_str（定錨點，同 Fact_NodeFlux.Date）
+          Lookback_Window = 0 / 21 / 63
+          Weight          = MC 快照 at past_str / total MC
+
+        語義：
+          LW=0  → past_str = now_str → 當日配置（now 側）
+          LW=21 → past_str = now_str - 21 交易日 → 一個月前配置（past 側）
+          LW=63 → past_str = now_str - 63 交易日 → 一季前配置（past 側）
+        → LW=21 vs LW=63 查的是不同 past_str 的 MC，自然不同。
         """
-        logger.info(f"📊 計算 {date_str} 的資金分配比例 (L0)...")
-        
-        sectors = self.config.L0_SECTORS
-        symbols_str = "'" + "','".join(sectors) + "'"
-        
-        # 抓取該日所有板塊的市值（優先使用修正值，fallback 到 FMP 原始值）
-        query = f"""
-            SELECT Symbol, COALESCE(Market_Cap_Refined, Market_Cap) AS Market_Cap
+        logger.info(f"📊 計算 {now_str} 的 12 節點配置快照（LW={lookback_window}，MC_at={past_str}）...")
+
+        sectors      = self.config.L0_SECTORS
+        hedge_syms   = ['BIL', 'SHV', 'TLT', 'GLD']
+        all_symbols  = list(dict.fromkeys(sectors + hedge_syms))
+        symbols_str  = "'" + "','".join(all_symbols) + "'"
+
+        df = self.execute_query(f"""
+            SELECT Symbol,
+                   COALESCE(Market_Cap_Refined, Market_Cap) AS Market_Cap
             FROM Fact_DailyPrice
-            WHERE [Date] = :d AND Symbol IN ({symbols_str})
-        """
-        df = self.execute_query(query, params={"d": date_str})
-        
+            WHERE [Date] = :d
+              AND Symbol IN ({symbols_str})
+              AND COALESCE(Market_Cap_Refined, Market_Cap) > 0
+        """, params={"d": past_str})
+        date_str = now_str
+
         if df.empty:
-            logger.warning(f"⚠️ {date_str} 無法取得市值數據。")
+            logger.warning(f"⚠️ {date_str} 無法取得市值數據，跳過。")
             return
 
-        total_mc = df['Market_Cap'].sum()
-        
-        # 準備寫入資料
-        data_list = []
-        for _, row in df.iterrows():
-            data_list.append({
-                "date": date_str,
-                "node": row['Symbol'],
-                "window": lookback_window,
-                "weight": float(row['Market_Cap'] / total_mc) if total_mc > 0 else 0
-            })
+        # HEDGE 合計
+        hedge_mc = float(df[df['Symbol'].isin(hedge_syms)]['Market_Cap'].sum())
 
-        # 同樣採用 Staging + Merge 模式
-        table_name = "Fact_NodeAllocation"
+        # 建立 12 節點列表（板塊 × 11 + HEDGE × 1）
+        sector_rows = df[df['Symbol'].isin(sectors)][['Symbol', 'Market_Cap']] \
+                        .rename(columns={'Symbol': 'Node_ID'}) \
+                        .to_dict('records')
+        all_rows = sector_rows + [{'Node_ID': 'HEDGE', 'Market_Cap': hedge_mc}]
+
+        total_mc = sum(float(r['Market_Cap']) for r in all_rows)
+        if total_mc <= 0:
+            logger.warning(f"⚠️ {date_str} 12 節點總市值為 0，跳過。")
+            return
+
+        data_list = [
+            {
+                "date":   date_str,
+                "node":   r['Node_ID'],
+                "window": lookback_window,
+                "weight": float(r['Market_Cap']) / total_mc,
+            }
+            for r in all_rows
+        ]
+
+        table_name    = "Fact_NodeAllocation"
         staging_table = f"#Staging_Alloc_{uuid.uuid4().hex[:8]}"
-        
+
         try:
             with self.engine.connect() as conn:
                 trans = conn.begin()
-                conn.execute(text(f"CREATE TABLE {staging_table} (d DATE, n VARCHAR(20), w INT, weight FLOAT)"))
-                
-                # 插入暫存
-                conn.execute(text(f"INSERT INTO {staging_table} (d, n, w, weight) VALUES (:date, :node, :window, :weight)"), data_list)
-                
-                # 合併至正式表
-                merge_sql = text(f"""
-                MERGE INTO {table_name} AS T
-                USING {staging_table} AS S
-                ON T.[Date] = S.d AND T.[Node_ID] = S.n AND T.[Lookback_Window] = S.w
-                WHEN MATCHED THEN
-                    UPDATE SET T.[Weight] = S.weight, T.[Updated_At] = GETDATE()
-                WHEN NOT MATCHED THEN
-                    INSERT ([Date], [Node_ID], [Lookback_Window], [Weight], [Updated_At])
-                    VALUES (S.d, S.n, S.w, S.weight, GETDATE());
-                """)
-                conn.execute(merge_sql)
+                conn.execute(text(
+                    f"CREATE TABLE {staging_table} "
+                    f"(d DATE, n VARCHAR(20), w INT, weight FLOAT)"
+                ))
+                conn.execute(
+                    text(f"INSERT INTO {staging_table} (d, n, w, weight) "
+                         f"VALUES (:date, :node, :window, :weight)"),
+                    data_list
+                )
+                conn.execute(text(f"""
+                    MERGE INTO {table_name} AS T
+                    USING {staging_table} AS S
+                    ON  T.[Date]            = S.d
+                    AND T.[Node_ID]         = S.n
+                    AND T.[Lookback_Window] = S.w
+                    WHEN MATCHED THEN
+                        UPDATE SET T.[Weight]     = S.weight,
+                                   T.[Updated_At] = GETDATE()
+                    WHEN NOT MATCHED THEN
+                        INSERT ([Date], [Node_ID], [Lookback_Window], [Weight], [Updated_At])
+                        VALUES (S.d, S.n, S.w, S.weight, GETDATE());
+                """))
                 trans.commit()
-                logger.success(f"✅ {date_str} 的 Fact_NodeAllocation 已存檔。")
+            logger.success(f"✅ {date_str} Fact_NodeAllocation（12 節點，LW={lookback_window}）已存檔。")
         except Exception as e:
             logger.error(f"❌ Fact_NodeAllocation 寫入失敗: {e}")
 
@@ -405,98 +485,101 @@ class DatabaseManipulation:
 
     def generate_net_flux_matrix(self, past_date, now_date, target_assets=None, hedge_assets=None):
         """
-        [運算引擎] 計算 ETF Observed Method，產出 12x12 資金流轉矩陣
+        [運算引擎] ETF Observed Method — 產出 N×N 資金流轉矩陣（N ≤ 12）
+
+        核心公式（代數簡化）：
+          F_net = Price_now × (Shares_now − Shares_past)
+          其中 Shares = COALESCE(Market_Cap_Refined, Market_Cap) / Close
+
+        物理意義：
+          F_net > 0 → 資金流入（市值增幅超過價格漲幅，表示有淨申購）
+          F_net < 0 → 資金流出（市值增幅低於價格漲幅，表示有淨贖回）
+          F_net = 0 → Shares 未變動（精確 0.0，無浮點誤差）
+
+        生命週期過濾（集合交集）：
+          XLRE（2015+）、XLC（2018+）等在 past_date 或 now_date 任一無資料，
+          自動剔除出當期矩陣，資金差額由守恆校正導向 HEDGE。
         """
-        logger.info(f"🌊 啟動 Net Flux 事實計算: {past_date} -> {now_date}")
-        
-        # 1. 動態參數處理
+        logger.info(f"🌊 Net Flux 計算: {past_date} → {now_date}")
+
         if target_assets is None:
-            target_assets = self.config.L0_SECTORS # 優先從 config 讀取
+            target_assets = self.config.L0_SECTORS
         if hedge_assets is None:
             hedge_assets = ['BIL', 'SHV', 'TLT', 'GLD']
-            
-        all_tickers = list(set(target_assets + hedge_assets))
-        
-        # 2. 抓取資料（優先使用修正值，fallback 到 FMP 原始值）
-        query = """
+
+        all_tickers = list(dict.fromkeys(target_assets + hedge_assets))
+
+        # ── 抓取兩個日期的收盤價 + 精鍊市值 ─────────────────────
+        df = self.execute_query("""
             SELECT [Date], Symbol, [Close] AS Price,
                    COALESCE(Market_Cap_Refined, Market_Cap) AS Market_Cap
             FROM Fact_DailyPrice
             WHERE [Date] IN :dates AND Symbol IN :symbols
-        """
-        df = self.execute_query(query, params={
-            "dates": (past_date, now_date), 
-            "symbols": tuple(all_tickers)
-        })
+              AND [Close] > 0
+              AND COALESCE(Market_Cap_Refined, Market_Cap) > 0
+        """, params={"dates": (past_date, now_date), "symbols": tuple(all_tickers)})
 
         if df.empty:
             logger.warning(f"⚠️ {past_date} 或 {now_date} 查無資料，請確認是否為交易日。")
             return None
 
         df['Date'] = df['Date'].astype(str)
-        
-        # 3. ⏳ 生命週期過濾 (Dynamic Node Pruning)
-        available_past = df[df['Date'] == past_date]['Symbol'].tolist()
-        available_now = df[df['Date'] == now_date]['Symbol'].tolist()
-        alive_tickers = list(set(available_past).intersection(set(available_now)))
-        
-        active_targets = [s for s in target_assets if s in alive_tickers]
-        active_hedges = [s for s in hedge_assets if s in alive_tickers]
-        
-        logger.info(f"📊 活躍節點: 目標群 {len(active_targets)} 檔, 避險群 {len(active_hedges)} 檔")
+
+        # ── 生命週期過濾：兩日都有資料才納入計算 ─────────────────
+        avail_past = set(df[df['Date'] == past_date]['Symbol'])
+        avail_now  = set(df[df['Date'] == now_date]['Symbol'])
+        alive      = avail_past & avail_now  # 集合交集，自動排除上市較晚的 ETF
+
+        active_targets = [s for s in target_assets if s in alive]
+        active_hedges  = [s for s in hedge_assets  if s in alive]
+        logger.info(f"📊 活躍節點: 板塊 {len(active_targets)} 檔, 避險 {len(active_hedges)} 檔")
 
         df_past = df[df['Date'] == past_date].set_index('Symbol')
-        df_now = df[df['Date'] == now_date].set_index('Symbol')
+        df_now  = df[df['Date'] == now_date].set_index('Symbol')
 
-        # 4. 核心運算：分離價格效應，計算淨流量 (F_net)
-        f_net_dict = {}
-        for sym in alive_tickers:
-            mc_p, pr_p = df_past.loc[sym, 'Market_Cap'], df_past.loc[sym, 'Price']
-            mc_n, pr_n = df_now.loc[sym, 'Market_Cap'], df_now.loc[sym, 'Price']
-            
-            if pd.notna(mc_p) and pr_p > 0:
-                # 計算該資產的自然增長率 (Return)
-                r_asset = (pr_n / pr_p) - 1
-                # 淨流量 = 實際市值 - (舊市值 * (1 + 報酬率))
-                f_net = mc_n - (mc_p * (1 + r_asset))
-                f_net_dict[sym] = f_net
-            else:
-                f_net_dict[sym] = 0
+        # ── F_net = Price_now × (Shares_now − Shares_past) ───────
+        f_net_dict: dict = {}
+        for sym in alive:
+            mc_p = float(df_past.loc[sym, 'Market_Cap'])
+            pr_p = float(df_past.loc[sym, 'Price'])
+            mc_n = float(df_now.loc[sym,  'Market_Cap'])
+            pr_n = float(df_now.loc[sym,  'Price'])
 
-        # 5. 整合為 12 個決策節點
-        nodes_f_net = {s: f_net_dict.get(s, 0) for s in active_targets}
-        # 避險池視為單一資金回收站
-        nodes_f_net['HEDGE'] = sum(f_net_dict.get(h, 0) for h in active_hedges)
+            shares_past     = mc_p / pr_p
+            shares_now      = mc_n / pr_n
+            f_net_dict[sym] = pr_n * (shares_now - shares_past)
 
-        # 區分 Source (流出 < 0) 與 Target (流入 > 0)
+        # ── 整合 12 決策節點：11 板塊 + 1 HEDGE ──────────────────
+        nodes_f_net: dict = {s: f_net_dict[s] for s in active_targets}
+        nodes_f_net['HEDGE'] = sum(f_net_dict.get(h, 0.0) for h in active_hedges)
+
+        # ── 分離流出（< 0）/ 流入（> 0）─────────────────────────
         outflows = {k: abs(v) for k, v in nodes_f_net.items() if v < 0}
-        inflows = {k: v for k, v in nodes_f_net.items() if v > 0}
-        
+        inflows  = {k: v     for k, v in nodes_f_net.items() if v > 0}
         total_out = sum(outflows.values())
-        total_in = sum(inflows.values())
+        total_in  = sum(inflows.values())
 
-        # 6. ⚖️ 流量守恆校正 (確保 Sankey 圖左右平衡)
-        # 若流出 > 流入，差額歸類為 HEDGE 流入；反之亦然
+        # ── 第一重守恆校正：差額導向 HEDGE ───────────────────────
         if total_out > total_in:
-            diff = total_out - total_in
-            inflows['HEDGE'] = inflows.get('HEDGE', 0) + diff
-            total_in = sum(inflows.values())
+            inflows['HEDGE']  = inflows.get('HEDGE', 0.0)  + (total_out - total_in)
         elif total_in > total_out:
-            diff = total_in - total_out
-            outflows['HEDGE'] = outflows.get('HEDGE', 0) + diff
-            total_out = sum(outflows.values())
+            outflows['HEDGE'] = outflows.get('HEDGE', 0.0) + (total_in - total_out)
 
-        # 7. 建立 12x12 轉移矩陣 (Proportional Allocation)
-        matrix_nodes = active_targets + (['HEDGE'] if 'HEDGE' not in active_targets else [])
-        flux_matrix = pd.DataFrame(0.0, index=matrix_nodes, columns=matrix_nodes)
+        total_flux = sum(outflows.values())  # 校正後 outflows == inflows
 
-        if total_in > 0:
+        # ── 建立 N×N 矩陣（比例傳導分配）────────────────────────
+        matrix_nodes = active_targets + ['HEDGE']
+        flux_matrix  = pd.DataFrame(0.0, index=matrix_nodes, columns=matrix_nodes)
+
+        if total_flux > 0:
             for source, out_val in outflows.items():
                 for target, in_val in inflows.items():
-                    # 比例分配：流出量 * (該流入點佔總流入之比例)
-                    flux_matrix.loc[source, target] = out_val * (in_val / total_in)
+                    flux_matrix.loc[source, target] = out_val * (in_val / total_flux)
 
-        logger.success(f"✅ Flux Matrix 生成完成 (總轉移資金: ${total_out:,.2f})")
+        logger.success(
+            f"✅ Flux Matrix {len(matrix_nodes)}×{len(matrix_nodes)} 生成完成，"
+            f"總轉移資金: ${total_flux:,.0f}"
+        )
         return flux_matrix
 
     def upsert_net_flux(self, flux_matrix, now_date, lookback_window=21):
@@ -591,158 +674,254 @@ class DatabaseManipulation:
         except Exception as e:
             logger.error(f"❌ {table_name} 寫入失敗: {e}")
 
-    def fix_split_mc_corrections(self, symbols, fmp_api_key, base_url="https://financialmodelingprep.com", dry_run=True):
+    def fix_split_mc_corrections(self, symbols, nasdaq_api_key, dry_run=True):
         """
-        [MC 拆股修正] 偵測並修正 FMP 錯誤回溯調整 Market_Cap 所造成的歷史斷崖。
+        [MC 拆股修正 v2] 使用 SFP closeunadj 精確還原 FMP 回溯調整造成的 MC 錯誤。
 
-        背景：FMP 在拆股後會將歷史 Price 與 Market_Cap 同時除以拆股比例。Price 調整是
-        業界慣例，但 MC 調整是 FMP 的錯誤行為（MC = P×N，拆股不改變 MC）。此錯誤
-        導致 Flux 計算跨越拆股日時看到人造的巨額假流量。
+        修正原理：
+          FMP 錯誤 = pre-split close 被回溯 ÷ ratio → MC = (close/ratio) × shares = MC_true/ratio
+          SFP closeunadj = 真實未調整收盤價
+          → Market_Cap_Refined = SFP_closeunadj × stable_pre_split_shares  ✓
 
-        FMP 的三種調整行為（均需處理）：
-        - 乾淨型（如 XLK）：拆股後一次性回溯所有歷史，但 post day-1 shares 尚未創建完畢
-          → 直接用緊鄰前後比較會低估（1.18x 而非 2x）
-        - 提前型（如 XLU）：拆股日前一天 MC 已跳到正確值，更早的記錄才需修正
-          → 以「緊鄰前」為比較基準會把已修正的記錄納入
-        - 分段型（如 XLY/XLE）：FMP 分兩批回溯，導致 pre-window 已含二次調整值
-          → 緊鄰前比較基準已偏高
+        修正範圍：
+          ① pre-split 期（Date < split_date）：
+               Market_Cap_Refined = closeunadj × stable_shares
+          ② post-split 階梯期（split_date ≤ Date < staircase_end）：
+               Market_Cap_Refined = closeunadj × (stable_shares × ratio)
+          ③ staircase_end 之後：
+               Market_Cap_Refined = NULL（FMP 值已恢復正確，COALESCE 自動 fallback）
 
-        偵測策略（threshold 法，天然幂等）：
-        1. 以「拆股日前 15~60 天」的穩定中位 MC 作為 stable_pre（避開過渡帶）
-        2. 計算閾值 threshold = stable_pre × (1 + ratio) / 2
-           （即「已被 FMP 砍半後」與「正確值」的中點）
-        3. UPDATE 條件加入 Market_Cap < threshold：
-           - 已被 FMP 砍半的記錄：MC ≈ stable_pre → 低於閾值 → 會被修正
-           - 過渡帶/已正確的記錄：MC ≈ stable_pre × ratio → 高於閾值 → 自動跳過
-        4. 重複執行安全：修正後記錄 MC 升至 stable_pre × ratio，超出閾值，不會再被修正
+        特性：
+          - 冪等：可重複執行，結果不變
+          - 只寫入 Market_Cap_Refined，Market_Cap（FMP 原始）永不覆寫
+          - 資料源：SHARADAR/ACTIONS（拆股事件）+ SHARADAR/SFP（closeunadj）
         """
         import requests
 
-        all_corrections = []
+        SFP_BASE = "https://data.nasdaq.com/api/v3"
 
-        for symbol in symbols:
-            try:
-                resp = requests.get(
-                    f"{base_url}/stable/splits?symbol={symbol}&apikey={fmp_api_key}",
-                    timeout=10
-                )
-                if resp.status_code != 200 or not resp.json():
-                    continue
-                splits = sorted(resp.json(), key=lambda x: x["date"], reverse=True)
-            except Exception as e:
-                logger.warning(f"⚠️ {symbol} 無法取得拆股資料: {e}")
+        def sfp_get(endpoint, params):
+            """帶 pagination 的 SFP 資料抓取"""
+            rows, cursor = [], None
+            while True:
+                p = {"api_key": nasdaq_api_key, "qopts.per_page": 10000}
+                p.update(params)
+                if cursor:
+                    p["qopts.cursor_id"] = cursor
+                r = requests.get(f"{SFP_BASE}/datatables/SHARADAR/{endpoint}.json",
+                                 params=p, timeout=60)
+                if not r.ok:
+                    logger.error(f"SFP {endpoint} HTTP {r.status_code}: {r.text[:120]}")
+                    break
+                d      = r.json()
+                rows.extend(d.get("datatable", {}).get("data", []))
+                cursor = d.get("meta", {}).get("next_cursor_id")
+                if not cursor:
+                    break
+            return rows
+
+        # ── Phase 1：從 SHARADAR/ACTIONS 取得拆股事件 ─────────────
+        logger.info("📋 Phase 1: 從 SFP ACTIONS 取得拆股事件...")
+        action_rows = sfp_get("ACTIONS", {
+            "ticker":     ",".join(symbols),
+            "action":     "split",
+            "date.gte":   "1998-01-01",
+        })
+        # columns: [date, action, ticker, name, value, contraticker, contraname]
+
+        if not action_rows:
+            logger.success("✅ 無拆股事件，無需修正。")
+            return
+
+        logger.info(f"  找到 {len(action_rows)} 筆拆股事件")
+
+        plan = []  # 修正計畫清單
+
+        for row in action_rows:
+            split_date_str, _, symbol, _, ratio, _, _ = row
+            if abs(ratio - 1.0) < 0.001:
                 continue
 
-            for split in splits:
-                split_date = split["date"]
-                ratio = split["numerator"] / split["denominator"]
+            logger.info(f"  分析 {symbol} {split_date_str} ratio={ratio:.4f}")
 
-                if abs(ratio - 1.0) < 0.001:
-                    continue
+            # ── Phase 2：DB 取得 stable_pre_split_shares ──────────
+            stable_df = self.execute_query("""
+                SELECT TOP 10 ROUND(Market_Cap / NULLIF([Close], 0), 0) AS Shares
+                FROM Fact_DailyPrice
+                WHERE Symbol = :sym
+                  AND [Date] <  DATEADD(day, -14, :sd)
+                  AND [Date] >= DATEADD(day, -75, :sd)
+                  AND Market_Cap IS NOT NULL AND Market_Cap > 0
+                  AND [Close]    IS NOT NULL AND [Close]    > 0
+                ORDER BY [Date] DESC
+            """, params={"sym": symbol, "sd": split_date_str})
 
-                # 跳過反向拆股（ratio < 1）及小幅 NAV 調整（ratio < 1.5）
-                # 這些案例的偵測邏輯會將自然歷史成長誤判為 FMP 錯誤調整
-                if ratio < 1.5:
-                    logger.debug(f"  SKIP {symbol} {split_date} ratio={ratio:.4f} (非正向拆股或幅度過小)")
-                    continue
+            if stable_df.empty:
+                logger.warning(f"  ⚠️ {symbol}: 找不到 pre-split 穩定股數，跳過")
+                continue
 
-                # 1. 取得穩定前期 MC：拆股日前 15~60 天，取中位數避免離群值
-                stable_df = self.execute_query("""
-                    SELECT TOP 10 Market_Cap
-                    FROM Fact_DailyPrice
-                    WHERE Symbol = :sym
-                      AND Date < DATEADD(day, -14, :sd)
-                      AND Date >= DATEADD(day, -75, :sd)
-                      AND Market_Cap IS NOT NULL AND Market_Cap > 0
-                    ORDER BY Date DESC
-                """, params={"sym": symbol, "sd": split_date})
+            stable_shares      = int(stable_df["Shares"].median())
+            correct_post_shares = int(stable_shares * ratio)
 
-                if stable_df.empty:
-                    continue
+            # 資料品質檢查：FMP 2020 前 ETF MC 可能是垃圾值（如 XLF 2016 = $16K）
+            if stable_shares < 1_000_000:
+                logger.warning(
+                    f"  ⚠️ {symbol} {split_date_str}: stable_shares={stable_shares:,} "
+                    f"過小（FMP MC 歷史品質問題），跳過此事件"
+                )
+                continue
 
-                stable_pre_mc = stable_df["Market_Cap"].median()
-                if stable_pre_mc <= 0:
-                    continue
+            # ── Phase 3：SFP 取得 closeunadj 序列 ─────────────────
+            sfp_rows = sfp_get("SFP", {
+                "ticker":        symbol,
+                "date.gte":      "1998-01-01",
+                "qopts.columns": "ticker,date,closeunadj",
+            })
+            if not sfp_rows:
+                logger.warning(
+                    f"  ⚠️ {symbol}: SFP 無 closeunadj 資料"
+                    f"（SFP 僅覆蓋 ETF/CEF，個股請用其他來源）"
+                )
+                continue
 
-                # 2. 閾值：「已砍半值」與「正確值」之間的中點
-                #    (1 + ratio) / 2：ratio=2 → threshold = 1.5 × stable_pre
-                threshold = stable_pre_mc * (1 + ratio) / 2
+            sfp_map = {str(r[1])[:10]: r[2] for r in sfp_rows if r[2]}
 
-                # 3. 計算在閾值以下（即被 FMP 砍半）且在拆股日前的記錄數
-                count_df = self.execute_query("""
-                    SELECT COUNT(*) AS cnt FROM Fact_DailyPrice
-                    WHERE Symbol     = :sym
-                      AND Date       <= :sd
-                      AND Market_Cap <  :thr
-                      AND Market_Cap IS NOT NULL
-                """, params={"sym": symbol, "sd": split_date, "thr": threshold})
+            # ── Phase 4：偵測 staircase_end（FMP shares 穩定日）──
+            tol = correct_post_shares * 0.02  # 2% 容差
+            sc_df = self.execute_query("""
+                SELECT MIN([Date]) AS stable_date
+                FROM Fact_DailyPrice
+                WHERE Symbol = :sym
+                  AND [Date]  > :sd
+                  AND [Close] > 0
+                  AND ABS(ROUND(Market_Cap / NULLIF([Close], 0), 0) - :exp) <= :tol
+            """, params={
+                "sym": symbol, "sd": split_date_str,
+                "exp": correct_post_shares, "tol": tol,
+            })
+            staircase_end = (str(sc_df.iloc[0, 0])[:10]
+                             if not sc_df.empty and sc_df.iloc[0, 0] is not None
+                             else None)
 
-                affected_rows = int(count_df.iloc[0, 0]) if not count_df.empty else 0
-                if affected_rows == 0:
-                    logger.debug(f"  SKIP {symbol} {split_date} {split['numerator']}:{split['denominator']} (無需修正或已修正)")
-                    continue
+            pre_count_df = self.execute_query(
+                "SELECT COUNT(*) AS n FROM Fact_DailyPrice "
+                "WHERE Symbol=:s AND [Date] < :d",
+                params={"s": symbol, "d": split_date_str}
+            )
+            pre_rows = int(pre_count_df.iloc[0, 0]) if not pre_count_df.empty else 0
 
-                all_corrections.append({
-                    "symbol":     symbol,
-                    "split_date": split_date,
-                    "ratio":      ratio,
-                    "label":      f"{split['numerator']}:{split['denominator']}",
-                    "stable_pre": stable_pre_mc / 1e9,
-                    "threshold":  threshold / 1e9,
-                    "rows":       affected_rows,
-                })
+            plan.append({
+                "symbol":        symbol,
+                "split_date":    split_date_str,
+                "ratio":         ratio,
+                "stable_shares": stable_shares,
+                "post_shares":   correct_post_shares,
+                "staircase_end": staircase_end,
+                "sfp_map":       sfp_map,
+                "pre_rows":      pre_rows,
+                "sfp_coverage":  sum(1 for d in sfp_map if d < split_date_str),
+            })
 
-            time.sleep(0.05)
-
-        # ── 報告 ──────────────────────────────────────────────
-        if not all_corrections:
-            logger.success("✅ 掃描完畢：未發現需要修正的 MC 斷崖。")
+        # ── 報告 ──────────────────────────────────────────────────
+        if not plan:
+            logger.success("✅ 掃描完畢：無需修正。")
             return
 
-        logger.info(f"\n{'='*70}")
-        logger.info(f"  MC 拆股修正報告（{'DRY-RUN，不寫入' if dry_run else '即將執行寫入'}）")
-        logger.info(f"{'='*70}")
-        for c in all_corrections:
+        logger.info(f"\n{'='*72}")
+        logger.info(f"  MC 拆股修正報告 v2（{'DRY-RUN' if dry_run else '即將執行寫入 Market_Cap_Refined'}）")
+        logger.info(f"{'='*72}")
+        for c in plan:
             logger.info(
-                f"  {c['symbol']:<8} {c['split_date']}  {c['label']:<12}"
-                f"  stable_pre={c['stable_pre']:.2f}B  threshold={c['threshold']:.2f}B"
-                f"  → 修正 {c['rows']:,} 筆"
+                f"  {c['symbol']:<6} {c['split_date']}  ratio={c['ratio']:.4f}"
+                f"  stable={c['stable_shares']:,}  post={c['post_shares']:,}"
+                f"  staircase_end={c['staircase_end'] or 'N/A':<12}"
+                f"  pre_rows={c['pre_rows']:,}  sfp_cov={c['sfp_coverage']:,}"
             )
-        logger.info(f"{'='*70}")
-        logger.info(f"  共 {len(all_corrections)} 筆拆股事件需修正")
+        logger.info(f"{'='*72}")
 
         if dry_run:
-            logger.warning("DRY-RUN 模式，未執行任何寫入。加上 --apply 參數以實際修正。")
+            logger.warning("DRY-RUN 模式，未執行寫入。加上 --apply 參數以實際修正。")
             return
 
-        # ── 執行修正 ──────────────────────────────────────────
-        logger.info("🔧 開始執行 MC 修正...")
+        # ── 執行修正（寫入 Market_Cap_Refined）────────────────────
+        logger.info("🔧 執行 MC 修正（寫入 Market_Cap_Refined，Market_Cap 不動）...")
         fixed = 0
-        for c in all_corrections:
-            try:
-                with self.engine.connect() as conn:
-                    trans = conn.begin()
-                    # Market_Cap × ratio；Shares_Outstanding = 新 MC / Close
-                    # SQL Server 中 SET 子句各欄位均引用修改前的原始值，故此寫法正確
-                    conn.execute(text("""
-                        UPDATE Fact_DailyPrice
-                        SET
-                            Market_Cap          = Market_Cap * :ratio,
-                            Shares_Outstanding  = Market_Cap * :ratio / NULLIF([Close], 0)
-                        WHERE Symbol     = :sym
-                          AND Date       <= :sd
-                          AND Market_Cap IS NOT NULL
-                          AND Market_Cap <  :thr
-                    """), {
-                        "ratio": c["ratio"],
-                        "sym":   c["symbol"],
-                        "sd":    c["split_date"],
-                        "thr":   c["threshold"] * 1e9,
-                    })
-                    trans.commit()
-                logger.success(f"  ✅ {c['symbol']} {c['split_date']} ({c['label']}) 修正完畢（{c['rows']:,} 筆）")
-                fixed += 1
-            except Exception as e:
-                logger.error(f"  ❌ {c['symbol']} {c['split_date']} 修正失敗: {e}")
 
-        logger.success(f"\n🎉 MC 拆股修正完成：{fixed}/{len(all_corrections)} 筆事件已處理。")
+        for c in plan:
+            symbol        = c["symbol"]
+            split_date    = c["split_date"]
+            sfp_map       = c["sfp_map"]
+            stable        = c["stable_shares"]
+            post          = c["post_shares"]
+            sc_end        = c["staircase_end"]
+
+            try:
+                # cutoff 邏輯：
+                #   staircase_end 存在 → 修正至 staircase_end（pre-split + 階梯期）
+                #   staircase_end 不存在 → 只修正 pre-split（post-split 可能已正確）
+                cutoff = sc_end if sc_end else split_date
+
+                # 取得修正範圍內的 Date / Close / Market_Cap
+                rows_df = self.execute_query("""
+                    SELECT [Date], [Close], Market_Cap
+                    FROM Fact_DailyPrice
+                    WHERE Symbol = :sym AND [Date] < :cut
+                      AND [Close] > 0 AND Market_Cap > 0
+                    ORDER BY [Date]
+                """, params={"sym": symbol, "cut": cutoff})
+
+                if rows_df.empty:
+                    logger.warning(f"  ⚠️ {symbol}: 修正範圍內無資料")
+                    continue
+
+                # 組裝批次更新列表
+                # pre-split：Market_Cap_Refined = Market_Cap × (closeunadj/Close)
+                #   等價於真實 MC，無論 shares 是否有 organic growth
+                # staircase 期：Market_Cap_Refined = closeunadj × post_shares
+                records = []
+                for _, row in rows_df.iterrows():
+                    dstr       = str(row["Date"])[:10]
+                    closeunadj = sfp_map.get(dstr)
+                    if not closeunadj or closeunadj <= 0:
+                        continue
+                    if dstr < split_date:
+                        # pre-split：用比例修正（自動處理 organic share growth）
+                        mc_refined = float(row["Market_Cap"]) * (closeunadj / float(row["Close"]))
+                    else:
+                        # staircase 期（只有 sc_end 存在時才到達此分支）
+                        mc_refined = closeunadj * post
+                    records.append({"mc": float(mc_refined), "sym": symbol, "d": dstr})
+
+                if not records:
+                    logger.warning(f"  ⚠️ {symbol}: sfp_map 無法覆蓋修正範圍")
+                    continue
+
+                # 批次寫入 Market_Cap_Refined（fast_executemany=True）
+                with self.engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE Fact_DailyPrice "
+                             "SET Market_Cap_Refined = :mc "
+                             "WHERE Symbol = :sym AND [Date] = :d"),
+                        records
+                    )
+                    # staircase_end 之後清空（FMP 已正確，COALESCE fallback 生效）
+                    if sc_end:
+                        conn.execute(
+                            text("UPDATE Fact_DailyPrice "
+                                 "SET Market_Cap_Refined = NULL "
+                                 "WHERE Symbol = :sym AND [Date] >= :sc"),
+                            {"sym": symbol, "sc": sc_end}
+                        )
+                    conn.commit()
+
+                logger.success(
+                    f"  ✅ {symbol} {split_date} ratio={c['ratio']:.4f}"
+                    f"  → {len(records):,} 筆寫入 Market_Cap_Refined"
+                    + (f"  staircase_end={sc_end}" if sc_end else "")
+                )
+                fixed += 1
+
+            except Exception as e:
+                logger.error(f"  ❌ {symbol} 修正失敗: {e}")
+
+        logger.success(f"\n🎉 MC 拆股修正完成：{fixed}/{len(plan)} 筆事件已處理。")

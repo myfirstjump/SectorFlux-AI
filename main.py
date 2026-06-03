@@ -62,11 +62,12 @@ def run_prediction_pipeline(tsf, args):
 def main():
     parser = argparse.ArgumentParser(description="SectorFlux-AI 量化調度入口")
     parser.add_argument('--item', type=str, required=True,
-                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc'],
+                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc', 'sanity_check', 'export_dash'],
                         help='執行項目')
     parser.add_argument('--horizon', type=str, default='M', choices=['M', 'Q', 'Y'], help='預測長度')
     parser.add_argument('--market', type=str, default='us', choices=['us', 'tw'], help='市場目標')
     parser.add_argument('--apply', action='store_true', help='fix_split_mc：實際執行寫入（預設為 dry-run）')
+    parser.add_argument('--batch', action='store_true', help='calculate_flux：批次填充 2020 以來全部歷史交易日')
 
     args = parser.parse_args()
     config = Configuration()
@@ -93,61 +94,260 @@ def main():
             crawler.fetch_etf_holdings()
 
         elif args.item == 'fix_split_mc':
+            import os
+            nasdaq_key = os.getenv("NASDAQ_DL_API_KEY", "")
+            if not nasdaq_key:
+                logger.error("❌ NASDAQ_DL_API_KEY 未設定，fix_split_mc 需要 SFP 訂閱。")
+                sys.exit(1)
             mode = "執行寫入" if args.apply else "DRY-RUN（預覽，不寫入）"
-            logger.info(f"🔧 啟動 MC 拆股修正任務（{mode}）...")
-            symbols = (
-                config.L0_SECTORS + config.L1_THEMATICS + config.L2_UNIVERSE +
-                config.RISK_PROXY + config.AUTHORITATIVE_ETFS
-            )
-            symbols = list(set(symbols))
+            logger.info(f"🔧 啟動 MC 拆股修正任務 v2（{mode}）...")
+            symbols = list(dict.fromkeys(
+                config.L0_SECTORS + config.L1_THEMATICS +
+                config.L2_UNIVERSE + config.RISK_PROXY
+            ))
             db.fix_split_mc_corrections(
                 symbols=symbols,
-                fmp_api_key=config.FMP_API_KEY,
+                nasdaq_api_key=nasdaq_key,
                 dry_run=not args.apply,
             )
 
         elif args.item == 'calculate_flux':
-            # 1. 取得最新交易日作為 Now
-            res = db.execute_query("SELECT MAX(Date) FROM Fact_DailyPrice")
-            if res.empty or pd.isna(res.iloc[0, 0]):
-                logger.error("💥 資料庫無數據，無法計算流量。")
-                return
-                
-            now_date = res.iloc[0, 0]
-            now_str = now_date.strftime('%Y-%m-%d')
-            
-            # 2. 定義計算窗口 (M=21, Q=63)
             window_size = 21 if args.horizon == 'M' else 63
-            
-            # 3. 取得 N 個交易日前作為 Past
-            # 透過 row_num = window + 1 取得起點日期
-            past_query = """
-                SELECT Date FROM (
-                    SELECT Date, ROW_NUMBER() OVER (ORDER BY Date DESC) as row_num
-                    FROM (SELECT DISTINCT Date FROM Fact_DailyPrice WHERE Date <= :now) t
-                ) r WHERE row_num = :rn
-            """
-            past_res = db.execute_query(past_query, params={"now": now_str, "rn": window_size + 1})
-            
-            if not past_res.empty:
-                past_date = past_res.iloc[0, 0]
-                past_str = past_date.strftime('%Y-%m-%d')
-                logger.info(f"🌊 正在計算過去事實流向: {past_str} -> {now_str} (Window: {window_size}D)")
-                
-                # A. 產出流量矩陣
-                flux_matrix = db.generate_net_flux_matrix(past_date=past_str, now_date=now_str)
-                
-                if flux_matrix is not None:
-                    # B. 持久化事實流向 (Fact_NodeFlux)
-                    db.upsert_net_flux(flux_matrix, now_str, lookback_window=window_size)
-                    
-                    # C. 🔥 同步持久化事實水位 (Fact_NodeAllocation)
-                    # 這能讓前端知道這筆流量發生時，各板塊原本的資金比例
-                    db.upsert_node_allocation(now_str, lookback_window=window_size)
-                    
-                    logger.success(f"✅ {now_str} 的流量真相與水位配置已完整同步至資料庫。")
+            l0_str     = "'" + "','".join(config.L0_SECTORS) + "'"
+
+            def _get_past_date(now_str, window):
+                """取得 now_str 往前 window 個交易日的起點日期"""
+                r = db.execute_query("""
+                    SELECT Date FROM (
+                        SELECT Date, ROW_NUMBER() OVER (ORDER BY Date DESC) AS rn
+                        FROM (SELECT DISTINCT Date FROM Fact_DailyPrice
+                              WHERE Date <= :now) t
+                    ) r WHERE rn = :rn
+                """, params={"now": now_str, "rn": window + 1})
+                return r.iloc[0, 0].strftime('%Y-%m-%d') if not r.empty else None
+
+            def _run_one(now_str):
+                """計算並持久化單一 now_date 的 Flux + Allocation"""
+                past_str = _get_past_date(now_str, window_size)
+                if not past_str:
+                    return False
+                flux_matrix = db.generate_net_flux_matrix(past_str, now_str)
+                if flux_matrix is None:
+                    return False
+                db.upsert_net_flux(flux_matrix, now_str, lookback_window=window_size)
+                db.upsert_node_allocation(now_str, now_str,  lookback_window=0)
+                db.upsert_node_allocation(now_str, past_str, lookback_window=window_size)
+                return True
+
+            if args.batch:
+                # ── 歷史批次模式：填充 2020-01-01 以來全部交易日 ────
+                logger.info(f"📦 批次模式：填充歷史 Flux（LW={window_size}D）")
+
+                # 取得所有有效 now_date 候選（有 MC 資料的 L0 交易日，從 2020 起）
+                all_dates_df = db.execute_query(f"""
+                    SELECT DISTINCT [Date]
+                    FROM Fact_DailyPrice
+                    WHERE Symbol IN ({l0_str})
+                      AND COALESCE(Market_Cap_Refined, Market_Cap) > 0
+                      AND [Date] >= '2020-01-01'
+                    ORDER BY [Date]
+                """)
+                all_dates = [r.strftime('%Y-%m-%d') for r in all_dates_df.iloc[:, 0]]
+
+                # 已存在的 now_date（跳過，冪等）
+                done_df = db.execute_query(
+                    "SELECT DISTINCT CONVERT(VARCHAR,Date,23) AS d FROM Fact_NodeFlux "
+                    "WHERE Lookback_Window = :lw",
+                    params={"lw": window_size}
+                )
+                done_set = set(done_df['d'].tolist()) if not done_df.empty else set()
+
+                todo = [d for d in all_dates if d not in done_set]
+                logger.info(f"  全部 {len(all_dates)} 日，已完成 {len(done_set)}，待計算 {len(todo)} 日")
+
+                ok = skip = err = 0
+                for i, now_str in enumerate(todo):
+                    try:
+                        if _run_one(now_str):
+                            ok += 1
+                        else:
+                            skip += 1
+                    except Exception as e:
+                        logger.error(f"  ❌ {now_str} 失敗: {e}")
+                        err += 1
+                    if (i + 1) % 100 == 0 or (i + 1) == len(todo):
+                        logger.info(f"  進度 {i+1}/{len(todo)}  ✅{ok} ⏭{skip} ❌{err}")
+
+                logger.success(f"🎉 批次完成：✅{ok} ⏭{skip} ❌{err}")
+
             else:
-                logger.error(f"無法找到足夠的歷史日期 (需要往回找 {window_size} 筆) 來計算流量事實。")
+                # ── 單日模式：計算最新一筆 ────────────────────────
+                res = db.execute_query(f"""
+                    SELECT MAX([Date]) FROM Fact_DailyPrice
+                    WHERE Symbol IN ({l0_str})
+                      AND COALESCE(Market_Cap_Refined, Market_Cap) > 0
+                """)
+                if res.empty or pd.isna(res.iloc[0, 0]):
+                    logger.error("💥 資料庫無有效 MC 數據。")
+                    sys.exit(1)
+                now_str = res.iloc[0, 0].strftime('%Y-%m-%d')
+                past_str = _get_past_date(now_str, window_size)
+                logger.info(f"🌊 計算: {past_str} → {now_str} (LW={window_size}D)")
+                flux_matrix = db.generate_net_flux_matrix(past_str, now_str)
+                if flux_matrix is not None:
+                    db.upsert_net_flux(flux_matrix, now_str, lookback_window=window_size)
+                    db.upsert_node_allocation(now_str, now_str,  lookback_window=0)
+                    db.upsert_node_allocation(now_str, past_str, lookback_window=window_size)
+                    logger.success(f"✅ {now_str} Flux + Allocation 已存檔。")
+
+        elif args.item == 'sanity_check':
+            """
+            能量守恆斷言測試 (Sanity Check)
+            ① Fact_NodeFlux：每個 (Date, Lookback_Window) 的節點淨流量總和應 ≈ 0
+            ② Fact_NodeAllocation：每個 (Date, Lookback_Window) 的 Weight 總和應 ≈ 1
+            違規時 exit(1)，可被 crontab 錯誤通知捕捉。
+            """
+            logger.info("🔍 執行能量守恆 Sanity Check...")
+            violations = 0
+
+            # ── 1. Flux 能量守恆 ──────────────────────────────────
+            flux_violations = db.execute_query("""
+                SELECT [Date], [Lookback_Window],
+                       ABS(SUM(Net_Inflow_Outflow)) AS Leakage
+                FROM (
+                    SELECT [Date], [Target_Node_ID] AS Node, [Lookback_Window],
+                            SUM(Amount) AS Net_Inflow_Outflow
+                    FROM Fact_NodeFlux
+                    GROUP BY [Date], [Target_Node_ID], [Lookback_Window]
+                    UNION ALL
+                    SELECT [Date], [Source_Node_ID] AS Node, [Lookback_Window],
+                            -SUM(Amount) AS Net_Inflow_Outflow
+                    FROM Fact_NodeFlux
+                    GROUP BY [Date], [Source_Node_ID], [Lookback_Window]
+                ) t
+                GROUP BY [Date], [Lookback_Window]
+                HAVING ABS(SUM(Net_Inflow_Outflow)) > 0.01
+                ORDER BY Leakage DESC
+            """)
+            if not flux_violations.empty:
+                logger.error(f"❌ [Flux 能量守恆] 發現 {len(flux_violations)} 筆違規：")
+                for _, r in flux_violations.iterrows():
+                    logger.error(f"   Date={r['Date']}  LW={r['Lookback_Window']}  Leakage={r['Leakage']:.4f}")
+                violations += len(flux_violations)
+            else:
+                logger.success("✅ [Flux 能量守恆] 全部通過（總漏能 < 0.01）")
+
+            # ── 2. Allocation Weight 加總 ≈ 1 ────────────────────
+            alloc_violations = db.execute_query("""
+                SELECT [Date], [Lookback_Window],
+                       ABS(SUM(Weight) - 1.0) AS Weight_Error
+                FROM Fact_NodeAllocation
+                GROUP BY [Date], [Lookback_Window]
+                HAVING ABS(SUM(Weight) - 1.0) > 0.001
+                ORDER BY Weight_Error DESC
+            """)
+            if not alloc_violations.empty:
+                logger.error(f"❌ [Allocation 加總] 發現 {len(alloc_violations)} 筆違規：")
+                for _, r in alloc_violations.iterrows():
+                    logger.error(f"   Date={r['Date']}  LW={r['Lookback_Window']}  Error={r['Weight_Error']:.6f}")
+                violations += len(alloc_violations)
+            else:
+                logger.success("✅ [Allocation 加總] 全部通過（Weight Sum 誤差 < 0.001）")
+
+            # ── 統計摘要 ─────────────────────────────────────────
+            flux_count  = db.execute_query("SELECT COUNT(DISTINCT CONVERT(VARCHAR,Date,23)+CAST(Lookback_Window AS VARCHAR)) FROM Fact_NodeFlux").iloc[0,0]
+            alloc_count = db.execute_query("SELECT COUNT(DISTINCT CONVERT(VARCHAR,Date,23)+CAST(Lookback_Window AS VARCHAR)) FROM Fact_NodeAllocation").iloc[0,0]
+            logger.info(f"📊 Flux: {flux_count} (Date×LW) 組合  Allocation: {alloc_count} 組合")
+
+            if violations > 0:
+                logger.error(f"💥 Sanity Check 失敗：共 {violations} 筆違規")
+                sys.exit(1)
+            else:
+                logger.success(f"🎉 Sanity Check 全部通過")
+
+        elif args.item == 'export_dash':
+            """
+            匯出 Dash 前端所需的靜態 JSON 資料檔（/workspace/app/data/）。
+            每日爬蟲 + Flux 計算完成後執行，供 sectorflux_dash 容器讀取。
+            輸出：
+              alloc_timeseries.json  — LW=0 全部交易日配置（時序圖用）
+              spy_prices.json        — SPY 收盤
+              sankey_M.json          — LW=21 最新 now_date 的 past/now/flux
+              sankey_Q.json          — LW=63 同上
+            """
+            import json, os
+            data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app', 'data')
+            os.makedirs(data_dir, exist_ok=True)
+
+            logger.info(f"📦 匯出 Dash JSON 資料至 {data_dir} ...")
+
+            # 1. 時序圖：LW=0 全部交易日
+            df_alloc = db.execute_query("""
+                SELECT CONVERT(VARCHAR,Date,23) AS date, Node_ID AS node, Weight AS weight
+                FROM Fact_NodeAllocation WITH (NOLOCK)
+                WHERE Lookback_Window = 0
+                ORDER BY date, node
+            """)
+            with open(os.path.join(data_dir, 'alloc_timeseries.json'), 'w') as f:
+                json.dump(df_alloc.to_dict(orient='records'), f)
+            logger.info(f"  alloc_timeseries: {len(df_alloc)} rows")
+
+            # 2. SPY 收盤
+            spy = db.execute_query("""
+                SELECT CONVERT(VARCHAR,Date,23) AS date, [Close] AS spy_close
+                FROM Fact_DailyPrice WITH (NOLOCK)
+                WHERE Symbol = 'SPY' AND Date >= '2020-01-01'
+                ORDER BY date
+            """)
+            with open(os.path.join(data_dir, 'spy_prices.json'), 'w') as f:
+                json.dump(spy.to_dict(orient='records'), f)
+            logger.info(f"  spy_prices: {len(spy)} rows")
+
+            # 3. Sankey 資料（M + Q）
+            def _export_sankey(lw, fname):
+                r = db.execute_query("""
+                    SELECT TOP 1 CONVERT(VARCHAR,Date,23) AS d
+                    FROM Fact_NodeAllocation
+                    WHERE Lookback_Window = 0
+                      AND Date IN (SELECT Date FROM Fact_NodeAllocation WHERE Lookback_Window = :lw)
+                    ORDER BY Date DESC
+                """, params={"lw": lw})
+                if r.empty:
+                    logger.warning(f"  LW={lw}: 無資料，跳過")
+                    return
+                now_date = r.iloc[0, 0]
+
+                now_alloc  = db.execute_query(
+                    "SELECT Node_ID, Weight FROM Fact_NodeAllocation WHERE Date=:d AND Lookback_Window=0",
+                    params={"d": now_date}
+                ).set_index('Node_ID')['Weight'].to_dict()
+
+                past_alloc = db.execute_query(
+                    "SELECT Node_ID, Weight FROM Fact_NodeAllocation WHERE Date=:d AND Lookback_Window=:lw",
+                    params={"d": now_date, "lw": lw}
+                ).set_index('Node_ID')['Weight'].to_dict()
+
+                flux = db.execute_query("""
+                    SELECT Source_Node_ID AS src, Target_Node_ID AS tgt,
+                           Amount / 1e9 AS amount_b
+                    FROM Fact_NodeFlux
+                    WHERE Date = :d AND Lookback_Window = :lw AND Amount > 0
+                    ORDER BY Amount DESC
+                """, params={"d": now_date, "lw": lw})
+
+                payload = {
+                    "now_date":   now_date,
+                    "now_alloc":  now_alloc,
+                    "past_alloc": past_alloc,
+                    "flux":       flux.to_dict(orient='records'),
+                }
+                with open(os.path.join(data_dir, fname), 'w') as f:
+                    json.dump(payload, f)
+                logger.info(f"  {fname}: now={now_date}, flux={len(flux)} rows")
+
+            _export_sankey(21, 'sankey_M.json')
+            _export_sankey(63, 'sankey_Q.json')
+            logger.success("✅ Dash JSON 資料匯出完成")
 
         elif args.item == 'predict':
             logger.info("🔮 [TSF] 啟動 AI 趨勢預測任務：IBM Granite-TTM (r2)...")

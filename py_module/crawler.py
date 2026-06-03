@@ -1,3 +1,4 @@
+import os
 import time
 import requests
 import pandas as pd
@@ -14,7 +15,9 @@ class FinancialCrawler:
 
         self.config = config
         self.api_key = config.FMP_API_KEY
+        self.nasdaq_api_key = os.getenv("NASDAQ_DL_API_KEY", "")
         self.base_url = "https://financialmodelingprep.com"
+        self.sfp_base = "https://data.nasdaq.com/api/v3"
         self.db = DatabaseManipulation(config)
         self.session = self._create_retry_session()
 
@@ -40,28 +43,31 @@ class FinancialCrawler:
 
 
     def fetch_all_data(self, market='us', history_days=30):
-        """主入口：執行全市場爬取任務 (含拆股偵測與自動修復)"""
-        logger.info(f"🚀 開始執行 {market.upper()} 市場數據任務...")
+        """
+        主入口：執行核心標的宇宙的每日增量爬取。
+
+        資料源分工（v3，2026-06）：
+          OHLCV   ← SFP（SHARADAR/SFP），單次批量請求，無 FMP call 消耗
+          MC      ← FMP BASIC（historical-market-capitalization），每 symbol 1 call
+          拆股修正 ← fix_split_mc（SFP closeunadj × stable_shares），獨立執行
+
+        ⚠️ 拆股不再觸發 30 年重爬：拆股事件由 fix_split_mc --apply 處理，
+           爬蟲只做每日增量，不依賴 FMP ULTRA。
+        """
+        logger.info(f"🚀 開始執行 {market.upper()} 市場數據任務（核心 41 symbols）...")
 
         if market == 'us':
-            macro_universe = getattr(self.config, 'MACRO_UNIVERSE', []) # 加入宏觀因子
-            target_universe = self.config.get_all_tickers()
-            target_universe = target_universe + macro_universe
+            target_universe = self.config.get_core_tickers()
+            logger.info(f"📋 目標清單：{len(target_universe)} symbols（FMP BASIC 安全範圍）")
 
-            # === 🛡️ 階段一：拆股雷達 (Split Radar) ===
-            split_tickers = self._detect_splits(target_universe)
-
-            # === 🚀 階段二：執行抓取 ===
-            # 將拆股標的 (需重抓 30 年) 與 正常標的 (增量) 分流
-            normal_tickers = [t for t in target_universe if t not in split_tickers]
-
-            if split_tickers:
-                logger.warning(f"🚨 發現 {len(split_tickers)} 檔拆股標的，啟動 30 年修復灌注...")
-                self._fetch_and_store_prices(split_tickers, history_days=10950) # 30年
-
-            if normal_tickers:
-                logger.info(f"📋 開始執行 {len(normal_tickers)} 檔標的之常規增量更新 ({history_days} 天)...")
-                self._fetch_and_store_prices(normal_tickers, history_days)
+            if self.nasdaq_api_key:
+                # 優先路徑：SFP OHLCV + FMP BASIC MC
+                logger.info("🟢 使用 SFP（SHARADAR/SFP）抓取 OHLCV，FMP BASIC 抓取 MC")
+                self._fetch_sfp_prices(target_universe, history_days)
+            else:
+                # 降級路徑：純 FMP（NASDAQ_DL_API_KEY 未設定時）
+                logger.warning("⚠️ NASDAQ_DL_API_KEY 未設定，降級為純 FMP BASIC 爬蟲")
+                self._fetch_and_store_prices(target_universe, history_days)
 
     def _detect_splits(self, universe):
 
@@ -83,6 +89,260 @@ class FinancialCrawler:
         except Exception as e:
             logger.error(f"❌ 拆股偵測失敗: {e}")
             return []
+
+    def _fetch_sfp_prices(self, tickers, history_days):
+        """
+        [SFP 路徑] 使用 SHARADAR/SFP 抓取 OHLCV + FMP BASIC 抓取 MC，寫入 DB。
+
+        優點：
+          - SFP 單次批量請求所有 symbols（無 FMP call 消耗）
+          - closeunadj 欄位保留真實未調整價（fix_split_mc 修正依據）
+          - FMP BASIC MC：每 symbol 1 call，41 symbols = 41 calls << 250/day 上限
+        """
+        import gc
+
+        end_date   = datetime.now()
+        start_date = end_date - timedelta(days=history_days)
+        str_start  = start_date.strftime("%Y-%m-%d")
+        str_end    = end_date.strftime("%Y-%m-%d")
+
+        # ── 1. SFP 批量抓取 OHLCV ────────────────────────────────
+        logger.info(f"[SFP] 批量抓取 {len(tickers)} symbols OHLCV ({str_start} ~ {str_end})...")
+        sfp_rows = []
+        cursor   = None
+        tickers_str = ",".join(tickers)
+
+        while True:
+            params = {
+                "ticker":         tickers_str,
+                "date.gte":       str_start,
+                "date.lte":       str_end,
+                "qopts.columns":  "ticker,date,open,high,low,close,volume,closeunadj",
+                "qopts.per_page": 10000,
+                "api_key":        self.nasdaq_api_key,
+            }
+            if cursor:
+                params["qopts.cursor_id"] = cursor
+            try:
+                resp = self.session.get(
+                    f"{self.sfp_base}/datatables/SHARADAR/SFP.json",
+                    params=params, timeout=60
+                )
+                d      = resp.json()
+                page   = d.get("datatable", {}).get("data", [])
+                sfp_rows.extend(page)
+                cursor = d.get("meta", {}).get("next_cursor_id")
+                if not cursor:
+                    break
+            except Exception as e:
+                logger.error(f"❌ SFP 批量抓取失敗: {e}")
+                break
+
+        if not sfp_rows:
+            logger.warning("⚠️ SFP 回傳 0 筆資料，跳過本次更新。")
+            return
+
+        df_sfp = pd.DataFrame(sfp_rows,
+                              columns=["Symbol", "Date", "Open", "High", "Low", "Close",
+                                       "Volume", "closeunadj"])
+        df_sfp["Date"] = pd.to_datetime(df_sfp["Date"])
+        df_sfp.drop_duplicates(subset=["Symbol", "Date"], inplace=True)
+        logger.info(f"[SFP] 取得 {len(df_sfp)} 筆 OHLCV（{df_sfp['Symbol'].nunique()} symbols）")
+
+        # ── 2. FMP BASIC 逐一抓取 MC ─────────────────────────────
+        logger.info(f"[FMP] 逐一抓取 {len(tickers)} symbols 市值...")
+        all_mc = []
+        for idx, symbol in enumerate(tickers):
+            try:
+                mc_url = (f"{self.base_url}/stable/historical-market-capitalization"
+                          f"?symbol={symbol}&from={str_start}&to={str_end}&apikey={self.api_key}")
+                mc_resp = self.session.get(mc_url, timeout=30).json()
+                if isinstance(mc_resp, list):
+                    all_mc.extend(mc_resp)
+            except Exception as e:
+                logger.warning(f"⚠️ [{idx+1}/{len(tickers)}] {symbol} MC 抓取失敗: {e}")
+            time.sleep(0.05)
+
+        df_mc = pd.DataFrame(all_mc) if all_mc else pd.DataFrame(columns=["symbol", "date", "marketCap"])
+        if not df_mc.empty:
+            df_mc.rename(columns={"symbol": "Symbol", "date": "Date", "marketCap": "Market_Cap"}, inplace=True)
+            df_mc["Date"] = pd.to_datetime(df_mc["Date"])
+            df_mc.drop_duplicates(subset=["Symbol", "Date"], inplace=True)
+
+        # ── 3. 合併並寫入 DB ──────────────────────────────────────
+        if not df_mc.empty:
+            df_final = pd.merge(df_sfp, df_mc[["Symbol", "Date", "Market_Cap"]],
+                                on=["Symbol", "Date"], how="left")
+        else:
+            df_final = df_sfp.copy()
+            df_final["Market_Cap"] = None
+
+        df_final["Shares_Outstanding"] = df_final.apply(
+            lambda r: r["Market_Cap"] / r["Close"]
+            if pd.notna(r.get("Market_Cap")) and pd.notna(r["Close"]) and r["Close"] != 0
+            else None,
+            axis=1
+        )
+
+        # upsert 前先保留帶 closeunadj 的副本，供拆股 patch 使用
+        df_for_patch = df_final.copy()
+
+        df_final.drop(columns=["closeunadj"], inplace=True)
+        self.db.upsert_market_data(df_final)
+        logger.info(f"✅ SFP 爬蟲完成：{len(df_final)} 筆寫入 DB")
+
+        # Change 2 & 3：upsert 後補寫拆股修正 + 偵測新拆股
+        self._patch_split_corrections(df_for_patch)
+
+        del df_sfp, df_mc, df_final, df_for_patch, sfp_rows, all_mc
+        gc.collect()
+
+    def _patch_split_corrections(self, df_merged):
+        """
+        Change 2 & 3：每日爬蟲結束後自動執行的 MC 修正補丁。
+
+        Change 2 — 活躍拆股修正：
+          對本次爬取的日期中，屬於 pre-split 或 staircase 期的記錄，
+          補寫正確的 Market_Cap_Refined（upsert 已重置，需重補）。
+
+        Change 3 — 新拆股偵測：
+          若 7 天內偵測到新拆股，記錄警告並提示執行 fix_split_mc --apply
+          以修正完整的歷史 MC 資料。
+        """
+        from datetime import date, timedelta
+        from sqlalchemy import text
+
+        if not self.nasdaq_api_key:
+            return
+
+        today        = date.today()
+        window_start = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+        new_split_threshold = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        tickers = df_merged["Symbol"].dropna().unique().tolist()
+        if not tickers:
+            return
+
+        # ── 1. 查詢近 90 天的拆股事件 ────────────────────────────
+        try:
+            r = self.session.get(
+                f"{self.sfp_base}/datatables/SHARADAR/ACTIONS.json",
+                params={
+                    "ticker":   ",".join(tickers),
+                    "action":   "split",
+                    "date.gte": window_start,
+                    "api_key":  self.nasdaq_api_key,
+                },
+                timeout=20,
+            )
+            action_rows = r.json().get("datatable", {}).get("data", []) if r.ok else []
+        except Exception as e:
+            logger.warning(f"⚠️ [patch] ACTIONS 查詢失敗: {e}")
+            return
+
+        if not action_rows:
+            return
+
+        # ── 2. 逐一處理每個活躍拆股 ──────────────────────────────
+        for row in action_rows:
+            split_date_str, _, symbol, _, ratio, _, _ = row
+            if abs(ratio - 1.0) < 0.001:
+                continue
+
+            # Change 3：新拆股警告（7 天內）
+            if split_date_str >= new_split_threshold:
+                logger.warning(
+                    f"🚨 [新拆股] {symbol} {split_date_str} ratio={ratio:.4f} — "
+                    f"FMP 歷史 MC 已被回溯污染！"
+                    f"請儘速執行：docker exec sectorflux_worker "
+                    f"python main.py --item fix_split_mc --apply"
+                )
+
+            # 取得 stable_shares
+            stable_df = self.db.execute_query("""
+                SELECT TOP 10 ROUND(Market_Cap / NULLIF([Close], 0), 0) AS Shares
+                FROM Fact_DailyPrice
+                WHERE Symbol = :sym
+                  AND [Date] <  DATEADD(day, -14, :sd)
+                  AND [Date] >= DATEADD(day, -75, :sd)
+                  AND Market_Cap IS NOT NULL AND Market_Cap > 0
+                  AND [Close]    IS NOT NULL AND [Close]    > 0
+                ORDER BY [Date] DESC
+            """, params={"sym": symbol, "sd": split_date_str})
+
+            if stable_df.empty:
+                continue
+            stable_shares = int(stable_df["Shares"].median())
+            if stable_shares < 1_000_000:
+                continue
+            post_shares = int(stable_shares * ratio)
+
+            # 取得 staircase_end（如有）
+            tol = post_shares * 0.02
+            sc_df = self.db.execute_query("""
+                SELECT MIN([Date]) AS stable_date
+                FROM Fact_DailyPrice
+                WHERE Symbol = :sym AND [Date] > :sd AND [Close] > 0
+                  AND ABS(ROUND(Market_Cap / NULLIF([Close], 0), 0) - :exp) <= :tol
+            """, params={"sym": symbol, "sd": split_date_str,
+                         "exp": post_shares, "tol": tol})
+
+            staircase_end = (str(sc_df.iloc[0, 0])[:10]
+                             if not sc_df.empty and sc_df.iloc[0, 0] is not None
+                             else None)
+
+            cutoff = staircase_end if staircase_end else split_date_str
+
+            # 篩選本次爬取資料中需要修正的行
+            sym_df = df_merged[df_merged["Symbol"] == symbol].copy()
+            if sym_df.empty:
+                continue
+
+            sym_df["_dstr"] = sym_df["Date"].dt.strftime("%Y-%m-%d")
+            to_correct = sym_df[sym_df["_dstr"] < cutoff]
+            if to_correct.empty:
+                continue
+
+            # 組裝批次更新記錄
+            records = []
+            for _, r2 in to_correct.iterrows():
+                dstr       = r2["_dstr"]
+                closeunadj = r2.get("closeunadj")
+                fmp_close  = r2["Close"]
+                fmp_mc     = r2.get("Market_Cap")
+
+                if not closeunadj or closeunadj <= 0:
+                    continue
+
+                if dstr < split_date_str:
+                    # pre-split：MC_refined = MC × (closeunadj / close)
+                    if not fmp_mc or not fmp_close or fmp_close == 0:
+                        continue
+                    mc_refined = float(fmp_mc) * (closeunadj / fmp_close)
+                else:
+                    # staircase 期
+                    mc_refined = float(closeunadj) * post_shares
+
+                records.append({"mc": mc_refined, "sym": symbol, "d": dstr})
+
+            if not records:
+                continue
+
+            try:
+                with self.db.engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE Fact_DailyPrice "
+                             "SET Market_Cap_Refined = :mc "
+                             "WHERE Symbol = :sym AND [Date] = :d"),
+                        records,
+                    )
+                    conn.commit()
+                logger.info(
+                    f"🔧 [patch] {symbol} {split_date_str}: "
+                    f"{len(records)} 筆 Market_Cap_Refined 補寫完成"
+                )
+            except Exception as e:
+                logger.error(f"❌ [patch] {symbol} 補寫失敗: {e}")
 
     def _fetch_and_store_prices(self, tickers, history_days):
 

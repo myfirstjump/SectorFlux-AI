@@ -98,6 +98,19 @@ class Configuration:
                 
         return expanded_tickers
     
+    def get_core_tickers(self):
+        """
+        核心標的宇宙（42 symbols）：適用 FMP BASIC（250 calls/day）每日爬蟲。
+        不含 S&P500 展開與 ETF 成分股，僅包含 SectorFlux 直接使用的固定清單。
+        """
+        return list(dict.fromkeys(
+            self.L0_SECTORS +
+            self.L1_THEMATICS +
+            self.L2_UNIVERSE +
+            self.RISK_PROXY +
+            self.MACRO_UNIVERSE
+        ))
+
     def get_all_tickers(self):
         """終極宇宙聚合：合併所有靜態清單與動態成分股"""
         logger.info("啟動標的宇宙擴充程序，正在連接 FMP API...")
