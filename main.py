@@ -62,7 +62,7 @@ def run_prediction_pipeline(tsf, args):
 def main():
     parser = argparse.ArgumentParser(description="SectorFlux-AI 量化調度入口")
     parser.add_argument('--item', type=str, required=True,
-                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc', 'sanity_check', 'export_dash'],
+                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc', 'sanity_check', 'export_dash', 'build_flux_features'],
                         help='執行項目')
     parser.add_argument('--horizon', type=str, default='M', choices=['M', 'Q', 'Y'], help='預測長度')
     parser.add_argument('--market', type=str, default='us', choices=['us', 'tw'], help='市場目標')
@@ -265,6 +265,20 @@ def main():
             else:
                 logger.success(f"🎉 Sanity Check 全部通過")
 
+        elif args.item == 'build_flux_features':
+            """
+            建立 TTM 模型輸入：每日 12 節點淨流特徵（Feature_DailyNodeFlux）。
+            net_flux_weight = 節點當日淨流金額 / 12 節點總市值（帶正負、可加性）。
+            含股數跳變中和（拆股/MC 修正假流量）+ winsorize。
+            """
+            logger.info("🧬 建立每日 flux 特徵序列（Feature_DailyNodeFlux）...")
+            out = db.build_daily_flux_features(dry_run=False)
+            if out:
+                stats, _ = out
+                logger.info(f"📊 {stats['rows']} 交易日 × 12 節點，"
+                            f"範圍 {stats['date_min']}~{stats['date_max']}，"
+                            f"absmax={stats['absmax']*100:.2f}%（winsorize 前）")
+
         elif args.item == 'export_dash':
             """
             匯出 Dash 前端所需的靜態 JSON 資料檔（/workspace/app/data/）。
@@ -329,54 +343,109 @@ def main():
 
                 flux = db.execute_query("""
                     SELECT Source_Node_ID AS src, Target_Node_ID AS tgt,
-                           Amount / 1e9 AS amount_b
+                           Amount / 1e9   AS amount_b,
+                           Flux_Weight    AS flux_weight
                     FROM Fact_NodeFlux
                     WHERE Date = :d AND Lookback_Window = :lw AND Amount > 0
                     ORDER BY Amount DESC
                 """, params={"d": now_date, "lw": lw})
 
+                # 12 節點（11 L0 + HEDGE 四檔合計）於 now_date 的總市值（B）
+                # 供前端把 allocation transport 的 weight 轉回近似美元金額
+                total_mc_b = float(db.execute_query("""
+                    SELECT SUM(COALESCE(Market_Cap_Refined, Market_Cap)) / 1e9 AS mc
+                    FROM Fact_DailyPrice
+                    WHERE [Date] = :d
+                      AND Symbol IN ('XLK','XLF','XLV','XLE','XLI','XLY','XLP',
+                                     'XLU','XLB','XLRE','XLC','BIL','SHV','TLT','GLD')
+                      AND COALESCE(Market_Cap_Refined, Market_Cap) > 0
+                """, params={"d": now_date}).iloc[0, 0] or 0.0)
+
+                # 未來佔比：讀 Forecast_NodeFlux 最新一次推論（self-row: Source==Target）
+                fut_df = db.execute_query("""
+                    SELECT Source_Node_ID AS node, Flux_Weight AS w
+                    FROM Forecast_NodeFlux
+                    WHERE Lookback_Window = :lw
+                      AND Forecast_At = (SELECT MAX(Forecast_At) FROM Forecast_NodeFlux
+                                         WHERE Lookback_Window = :lw)
+                      AND Source_Node_ID = Target_Node_ID
+                """, params={"lw": lw})
+                fut_alloc = (fut_df.set_index('node')['w'].to_dict()
+                             if not fut_df.empty else None)
+
                 payload = {
                     "now_date":   now_date,
                     "now_alloc":  now_alloc,
                     "past_alloc": past_alloc,
+                    "fut_alloc":  fut_alloc,          # None → 前端 fallback 模擬
                     "flux":       flux.to_dict(orient='records'),
+                    "total_mc_b": total_mc_b,
                 }
                 with open(os.path.join(data_dir, fname), 'w') as f:
                     json.dump(payload, f)
-                logger.info(f"  {fname}: now={now_date}, flux={len(flux)} rows")
+                logger.info(f"  {fname}: now={now_date}, flux={len(flux)} rows, "
+                            f"forecast={'有' if fut_alloc else '無(模擬)'}")
 
             _export_sankey(21, 'sankey_M.json')
             _export_sankey(63, 'sankey_Q.json')
             logger.success("✅ Dash JSON 資料匯出完成")
 
         elif args.item == 'predict':
-            logger.info("🔮 [TSF] 啟動 AI 趨勢預測任務：IBM Granite-TTM (r2)...")
-            
+            logger.info("🔮 [TSF] 啟動 Flux 預測：IBM Granite-TTM-r2（zero-shot, 12ch）...")
             try:
-                # 1. 獲取基準日期
-                latest_date_query = "SELECT MAX(Date) FROM Fact_DailyPrice"
-                latest_date = db.execute_query(latest_date_query).iloc[0, 0]
-                
-                # 2. 抓取當前分配權重 (用於計算 Flux)
-                alloc_query = "SELECT Node_ID, Weight FROM Fact_NodeAllocation WHERE Date = :dt AND Lookback_Window = :lw"
-                alloc_df = db.execute_query(alloc_query, params={"dt": latest_date, "lw": 512})
-                current_alloc = dict(zip(alloc_df['Node_ID'], alloc_df['Weight']))
-
-                # 3. 張量建構與推論
+                from py_module.tsf_modules import TSFIntegrator
                 tsf = TSFIntegrator(config, db)
-                input_tensor = tsf.create_input_tensor(db, latest_date)
-                forecast_values = tsf.run_ttm_inference(input_tensor)
-                
-                if forecast_values is not None:
-                    # 4. 計算 12x12 未來流向矩陣
-                    flux_results = tsf.calculate_future_flux(forecast_values, current_alloc)
-                    
-                    # 5. 持久化存入新表 Forecast_NodeFlux
-                    db.save_predictions(latest_date, flux_results, context_window=512)
-                    logger.success("✅ [TSF] 預測流向已成功存入 Forecast_NodeFlux 表。")
-                    
+
+                # 1. 建構輸入張量（最近 512 日，12ch，已 z-score）
+                input_tensor, used_dates, scaler = tsf.create_input_tensor()
+                if input_tensor is None:
+                    logger.error("💥 無法建構輸入張量（請先 build_flux_features）。")
+                    sys.exit(1)
+
+                # 2. now allocation（Fact_NodeAllocation LW=0 最新快照）作為加法基準
+                r = db.execute_query("""
+                    SELECT TOP 1 CONVERT(VARCHAR,Date,23) d FROM Fact_NodeAllocation
+                    WHERE Lookback_Window=0 ORDER BY Date DESC
+                """)
+                now_date  = r.iloc[0, 0]
+                now_alloc = db.execute_query(
+                    "SELECT Node_ID, Weight FROM Fact_NodeAllocation WHERE Date=:d AND Lookback_Window=0",
+                    params={"d": now_date}
+                ).set_index('Node_ID')['Weight'].to_dict()
+
+                # 3. 12 節點總市值（把佔比換算近似 $）
+                total_mc_b = float(db.execute_query("""
+                    SELECT SUM(COALESCE(Market_Cap_Refined,Market_Cap))/1e9
+                    FROM Fact_DailyPrice
+                    WHERE [Date]=:d AND Symbol IN
+                      ('XLK','XLF','XLV','XLE','XLI','XLY','XLP','XLU','XLB','XLRE','XLC','BIL','SHV','TLT','GLD')
+                      AND COALESCE(Market_Cap_Refined,Market_Cap)>0
+                """, params={"d": now_date}).iloc[0, 0] or 0.0)
+
+                # 4. 推論 + 重建未來佔比
+                forecast = tsf.run_ttm_inference(input_tensor)
+                future   = tsf.reconstruct_future_allocation(forecast, now_alloc, scaler=scaler)
+
+                if future is not None:
+                    db.upsert_forecast_allocation(now_date, future, total_mc_b=total_mc_b,
+                                                  model_version='TTM-r2-zeroshot')
+                    logger.success(f"✅ [TSF] 未來佔比已存入 Forecast_NodeFlux（基準日 {now_date}）。")
+
             except Exception as e:
                 logger.error(f"💥 [TSF] 預測失敗: {e}")
+
+        elif args.item == 'backtest':
+            logger.info("📏 [Backtest] zero-shot 預測準度回測（單一切分，每週 anchor）...")
+            from py_module.backtest import BacktestManager
+            bt = BacktestManager(config, db)
+            res = bt.run(test_start='2025-01-01', anchor_freq=5)
+            if res:
+                logger.success("===== 回測結果（zero-shot vs persistence）=====")
+                logger.info(f"{'Horizon':<8}{'N':>5}{'MAE_model':>12}{'MAE_persist':>13}{'Skill':>9}{'MDA':>8}")
+                for hk, r in res.items():
+                    logger.info(f"{hk:<8}{r['n']:>5}{r['mae_model']:>12.5f}"
+                                f"{r['mae_persist']:>13.5f}{r['skill']*100:>8.1f}%{r['mda']*100:>7.1f}%")
+                logger.info("Skill>0 = 勝過 persistence；MDA>50% = 方向優於擲硬幣。")
 
     except Exception as e:
         logger.exception(f"💥 任務 [{args.item}] 執行失敗: {e}")

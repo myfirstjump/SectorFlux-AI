@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 import urllib.parse
 import pandas as pd
+import numpy as np
 import uuid
 from sqlalchemy import create_engine, text, bindparam
 from loguru import logger
@@ -90,8 +91,25 @@ class DatabaseManipulation:
                     )
                 """))
 
+                # ── Feature_DailyNodeFlux（TTM 模型輸入：每日 12ch 淨流特徵）──
+                # Net_Flux_Weight = 節點當日淨流金額 / 12 節點總市值（帶正負、可加性）
+                conn.execute(text("""
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sysobjects
+                        WHERE name='Feature_DailyNodeFlux' AND xtype='U'
+                    )
+                    CREATE TABLE Feature_DailyNodeFlux (
+                        [Date]            DATE         NOT NULL,
+                        [Node_ID]         VARCHAR(20)  NOT NULL,
+                        [Net_Flux_Weight] FLOAT        NOT NULL,
+                        [Updated_At]      DATETIME     DEFAULT GETDATE(),
+                        CONSTRAINT PK_Feature_DailyNodeFlux
+                            PRIMARY KEY ([Date], [Node_ID])
+                    )
+                """))
+
                 conn.commit()
-                logger.debug("Schema migration OK: 雙軌市值欄位 + Fact_NodeAllocation/Fact_NodeFlux 就緒。")
+                logger.debug("Schema migration OK: 雙軌市值欄位 + Fact_NodeAllocation/Fact_NodeFlux/Feature_DailyNodeFlux 就緒。")
         except Exception as e:
             logger.warning(f"⚠️ Schema migration 執行失敗: {e}")
 
@@ -144,8 +162,28 @@ class DatabaseManipulation:
         # 導致 "Error converting data type varchar to float"，必須替換為 None（→ SQL NULL）
         records = df[required_cols].copy()
         records['Date'] = pd.to_datetime(records['Date']).dt.strftime('%Y-%m-%d')
+
+        def _clean(col, v):
+            # NULL：nan / None 一律轉 SQL NULL
+            if v is None:
+                return None
+            if isinstance(v, float) and pd.isna(v):
+                return None
+            # numpy 標量 → 原生 Python（pyodbc 無法綁定 numpy.int64 等，會 str() 化）
+            if hasattr(v, 'item'):
+                v = v.item()
+            if isinstance(v, float) and pd.isna(v):
+                return None
+            # Volume 為 BIGINT 欄位：必須是乾淨整數，否則 "8882000.0" 字串無法轉 bigint
+            if col == 'Volume':
+                try:
+                    return int(round(float(v)))
+                except (TypeError, ValueError):
+                    return None
+            return v
+
         data_list = [
-            {k: (None if isinstance(v, float) and pd.isna(v) else v) for k, v in row.items()}
+            {k: _clean(k, v) for k, v in row.items()}
             for row in records.to_dict('records')
         ]
 
@@ -314,6 +352,190 @@ class DatabaseManipulation:
             logger.success(f"✅ {date_str} Fact_NodeAllocation（12 節點，LW={lookback_window}）已存檔。")
         except Exception as e:
             logger.error(f"❌ Fact_NodeAllocation 寫入失敗: {e}")
+
+    def build_daily_flux_features(self, start_date='2020-01-01', winsor=0.03, dry_run=False):
+        """
+        [TTM 特徵工程] 建立每日 12 節點淨流特徵序列 → Feature_DailyNodeFlux
+
+        定義（與專案 flux 公式一致，window=1 日）：
+          shares_X(D)   = COALESCE(Market_Cap_Refined, Market_Cap) / Close
+          F_net_X(D)    = Close_X(D) × (shares_X(D) − shares_X(D-1))   # 組織性淨流（$）
+          total_MC(D)   = Σ_{12 節點} COALESCE(Market_Cap_Refined, Market_Cap)
+          target_X(D)   = F_net_X(D) / total_MC(D)                      # 帶正負、可加到 allocation
+
+        HEDGE = BIL+SHV+TLT+GLD 之 F_net 加總。
+        winsor：對每個節點序列做雙尾截斷（預設 ±5%），壓掉拆股/資料缺口殘留尖刺。
+
+        回傳 stats dict（供驗證分佈）；dry_run=True 時只計算與回報、不寫 DB。
+        """
+        sectors    = self.config.L0_SECTORS
+        hedge_syms = ['BIL', 'SHV', 'TLT', 'GLD']
+        all_syms   = list(dict.fromkeys(sectors + hedge_syms))
+        syms_str   = "'" + "','".join(all_syms) + "'"
+
+        df = self.execute_query(f"""
+            SELECT CONVERT(VARCHAR,[Date],23) AS Date, Symbol,
+                   [Close] AS Price,
+                   COALESCE(Market_Cap_Refined, Market_Cap) AS MC
+            FROM Fact_DailyPrice WITH (NOLOCK)
+            WHERE Symbol IN ({syms_str})
+              AND [Date] >= :start
+              AND [Close] > 0
+              AND COALESCE(Market_Cap_Refined, Market_Cap) > 0
+            ORDER BY [Date]
+        """, params={"start": start_date})
+
+        if df.empty:
+            logger.error("💥 無價格資料，無法建立 flux 特徵。")
+            return None
+
+        df['Price'] = df['Price'].astype(float)
+        df['MC']    = df['MC'].astype(float)
+        df['shares'] = df['MC'] / df['Price']
+
+        price_pv  = df.pivot(index='Date', columns='Symbol', values='Price').sort_index()
+        shares_pv = df.pivot(index='Date', columns='Symbol', values='shares').sort_index()
+        mc_pv     = df.pivot(index='Date', columns='Symbol', values='MC').sort_index()
+
+        # F_net_X(D) = Price(D) × (shares(D) − shares(D-1))，用前一交易日（pivot 自動對齊）
+        f_net = price_pv * shares_pv.diff()          # 第一列為 NaN（無前日）
+
+        # ── 中和「股數跳變」假流量 ──────────────────────────────────
+        # 拆股（MC_Refined 邊界不連續）、stale-shares 修正（如 TLT 109.7M→590M）都會
+        # 讓單日 shares 比值遠離 1，使 F_net=Price×Δshares 算出巨大假流量。
+        # 真實組織性申購/贖回單日幾乎不可能讓 shares 變動 >40%，故 [0.7,1.4] 之外一律中和。
+        shares_ratio = shares_pv / shares_pv.shift(1)
+        jump_mask    = (shares_ratio < 0.7) | (shares_ratio > 1.4)
+        n_jumps = int(jump_mask.sum().sum())
+        if n_jumps:
+            logger.info(f"🔧 偵測並中和 {n_jumps} 個股數跳變 symbol-day（拆股/MC 修正假流量）")
+        f_net = f_net.mask(jump_mask, 0.0)
+
+        # 聚合成 12 節點
+        node_fnet = pd.DataFrame(index=f_net.index)
+        for s in sectors:
+            node_fnet[s] = f_net[s] if s in f_net.columns else 0.0
+        node_fnet['HEDGE'] = f_net[[h for h in hedge_syms if h in f_net.columns]].sum(axis=1)
+
+        total_mc = mc_pv.sum(axis=1)                 # 每日 12 節點總市值
+
+        # target = F_net / total_MC；total_MC 缺口（<=0/NaN）整列剔除
+        valid_mc = total_mc[total_mc > 0]
+        target = node_fnet.div(total_mc, axis=0)
+        target = target.loc[target.index.isin(valid_mc.index)]
+        target = target.dropna(how='any')            # 去掉首列與任何缺值列
+
+        node_order = sectors + ['HEDGE']
+        target = target[node_order]
+
+        # ── 分佈統計（winsorize 前）────────────────────────────────
+        flat = target.values.flatten()
+        stats = {
+            'rows':        len(target),
+            'date_min':    target.index.min(),
+            'date_max':    target.index.max(),
+            'total_mc_gaps': int((total_mc <= 0).sum()),
+            'q':           {p: float(np.quantile(flat, p)) for p in
+                            [0.001, 0.01, 0.05, 0.5, 0.95, 0.99, 0.999]},
+            'absmax':      float(np.abs(flat).max()),
+            'pct_gt_5':    float((np.abs(flat) > 0.05).mean() * 100),
+            'pct_gt_10':   float((np.abs(flat) > 0.10).mean() * 100),
+            'per_node_std': {n: float(target[n].std()) for n in node_order},
+        }
+
+        # ── winsorize（雙尾截斷）─────────────────────────────────
+        if winsor:
+            target = target.clip(lower=-winsor, upper=winsor)
+
+        if dry_run:
+            logger.info("🧪 dry_run：僅計算與回報，不寫入 DB。")
+            return stats, target
+
+        # ── 寫入 Feature_DailyNodeFlux（Staging + MERGE）──────────
+        long_df = target.reset_index().melt(
+            id_vars='Date', var_name='Node_ID', value_name='Net_Flux_Weight')
+        data_list = [
+            {"d": r['Date'], "n": r['Node_ID'], "v": float(r['Net_Flux_Weight'])}
+            for _, r in long_df.iterrows()
+        ]
+        staging = f"#Staging_Feat_{uuid.uuid4().hex[:8]}"
+        try:
+            with self.engine.connect() as conn:
+                trans = conn.begin()
+                conn.execute(text(
+                    f"CREATE TABLE {staging} (d DATE, n VARCHAR(20), v FLOAT)"))
+                conn.execute(text(
+                    f"INSERT INTO {staging} (d,n,v) VALUES (:d,:n,:v)"), data_list)
+                conn.execute(text(f"""
+                    MERGE INTO Feature_DailyNodeFlux AS T
+                    USING {staging} AS S
+                    ON T.[Date]=S.d AND T.[Node_ID]=S.n
+                    WHEN MATCHED THEN
+                        UPDATE SET T.[Net_Flux_Weight]=S.v, T.[Updated_At]=GETDATE()
+                    WHEN NOT MATCHED THEN
+                        INSERT ([Date],[Node_ID],[Net_Flux_Weight],[Updated_At])
+                        VALUES (S.d,S.n,S.v,GETDATE());
+                """))
+                trans.commit()
+            logger.success(f"✅ Feature_DailyNodeFlux 寫入 {len(data_list)} 筆（{stats['rows']} 日 × 12 節點）")
+        except Exception as e:
+            logger.error(f"❌ Feature_DailyNodeFlux 寫入失敗: {e}")
+        return stats, target
+
+    def upsert_forecast_allocation(self, now_date, future_by_horizon,
+                                   total_mc_b=0.0, model_version='TTM-r2-zeroshot'):
+        """
+        [預測持久化] 將未來各 horizon 的 12 節點佔比存入 Forecast_NodeFlux。
+
+        儲存慣例：Source_Node_ID = Target_Node_ID = 節點（self-row），
+                  Flux_Weight = 未來配置佔比，Amount = 佔比 × 總市值（近似 $）。
+        每次推論以 Forecast_At（精確時間）版本化；前端取 MAX(Forecast_At)。
+        future_by_horizon: {'M': {node: w}, 'Q': {node: w}}
+        """
+        horizon_days = {'M': 21, 'Q': 63}
+        cal_days     = {'M': 30, 'Q': 90}      # Target_Date 標示用（近似日曆天）
+        forecast_at  = datetime.now()
+
+        rows = []
+        for hk, alloc in future_by_horizon.items():
+            lw = horizon_days[hk]
+            target_date = (pd.Timestamp(now_date) +
+                           pd.Timedelta(days=cal_days[hk])).strftime('%Y-%m-%d')
+            for node, w in alloc.items():
+                rows.append({
+                    "fa": forecast_at, "td": target_date,
+                    "src": node, "tgt": node, "lw": int(lw),
+                    "amt": float(w) * total_mc_b * 1e9, "fw": float(w),
+                    "conf": 0.0, "mv": model_version,
+                })
+        if not rows:
+            return
+
+        staging = f"#Staging_Fcst_{uuid.uuid4().hex[:8]}"
+        try:
+            with self.engine.connect() as conn:
+                trans = conn.begin()
+                conn.execute(text(f"""
+                    CREATE TABLE {staging} (
+                        fa DATETIME, td DATE, src VARCHAR(20), tgt VARCHAR(20),
+                        lw INT, amt FLOAT, fw FLOAT, conf FLOAT, mv VARCHAR(50))
+                """))
+                conn.execute(text(f"""
+                    INSERT INTO {staging} (fa,td,src,tgt,lw,amt,fw,conf,mv)
+                    VALUES (:fa,:td,:src,:tgt,:lw,:amt,:fw,:conf,:mv)
+                """), rows)
+                conn.execute(text(f"""
+                    INSERT INTO Forecast_NodeFlux
+                      (Forecast_At, Target_Date, Source_Node_ID, Target_Node_ID,
+                       Lookback_Window, Amount, Flux_Weight, Confidence,
+                       Model_Version, Updated_At)
+                    SELECT fa,td,src,tgt,lw,amt,fw,conf,mv,GETDATE() FROM {staging}
+                """))
+                trans.commit()
+            logger.success(f"✅ Forecast_NodeFlux 寫入 {len(rows)} 筆（M+Q × 12 節點，"
+                           f"Model={model_version}）")
+        except Exception as e:
+            logger.error(f"❌ Forecast_NodeFlux 寫入失敗: {e}")
 
     def save_predictions(self, latest_date, flux_results, model_version="Granite-TTM-v2", context_window=512):
         """
