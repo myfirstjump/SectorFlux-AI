@@ -62,7 +62,7 @@ def run_prediction_pipeline(tsf, args):
 def main():
     parser = argparse.ArgumentParser(description="SectorFlux-AI 量化調度入口")
     parser.add_argument('--item', type=str, required=True,
-                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc', 'sanity_check', 'export_dash', 'build_flux_features'],
+                        choices=['crawler', 'seed_history', 'process', 'process_history', 'calculate_flux', 'predict', 'backtest', 'cluster', 'test-tensor', 'holdings', 'fix_split_mc', 'sanity_check', 'export_dash', 'build_flux_features', 'finetune'],
                         help='執行項目')
     parser.add_argument('--horizon', type=str, default='M', choices=['M', 'Q', 'Y'], help='預測長度')
     parser.add_argument('--market', type=str, default='us', choices=['us', 'tw'], help='市場目標')
@@ -434,18 +434,16 @@ def main():
             except Exception as e:
                 logger.error(f"💥 [TSF] 預測失敗: {e}")
 
+        elif args.item == 'finetune':
+            logger.info("🎯 [Finetune] TTM-r2 head-only fine-tune（train ≤2024）...")
+            from py_module.finetune import FineTuner
+            ft = FineTuner(config, db)
+            ft.run(epochs=40, lr=1e-3, batch=32)
+
         elif args.item == 'backtest':
-            logger.info("📏 [Backtest] zero-shot 預測準度回測（單一切分，每週 anchor）...")
+            logger.info("📏 [Backtest] 預測準度回測（單一切分，每週 anchor）...")
             from py_module.backtest import BacktestManager
-            bt = BacktestManager(config, db)
-            res = bt.run(test_start='2025-01-01', anchor_freq=5)
-            if res:
-                logger.success("===== 回測結果（zero-shot vs persistence）=====")
-                logger.info(f"{'Horizon':<8}{'N':>5}{'MAE_model':>12}{'MAE_persist':>13}{'Skill':>9}{'MDA':>8}")
-                for hk, r in res.items():
-                    logger.info(f"{hk:<8}{r['n']:>5}{r['mae_model']:>12.5f}"
-                                f"{r['mae_persist']:>13.5f}{r['skill']*100:>8.1f}%{r['mda']*100:>7.1f}%")
-                logger.info("Skill>0 = 勝過 persistence；MDA>50% = 方向優於擲硬幣。")
+            BacktestManager(config, db).run(test_start='2025-01-01', anchor_freq=5)
 
     except Exception as e:
         logger.exception(f"💥 任務 [{args.item}] 執行失敗: {e}")
